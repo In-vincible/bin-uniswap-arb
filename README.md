@@ -1,22 +1,20 @@
-Here's the updated version of the `README.md` file with the specified future enhancements and rearranged sections:
-
----
-
 # Arbitrage Trading Bot
 
 ## Basic Philosophy
 
-This project is designed to facilitate automated arbitrage trading between Binance and Uniswap. The core philosophy is to leverage price discrepancies between these two platforms to execute profitable trades. The bot continuously monitors prices and executes trades when predefined conditions are met, ensuring minimal risk and maximizing potential gains.
+This project focuses on validating potential arbitrage trades between Binance and Uniswap to avoid losses. The core philosophy is to thoroughly check trades against various scenarios that could go wrong, like network congestion sudden price movements, or high gas costs. While the bot monitors price differences between platforms it prioritizes careful validation over speed - running extensive checks before executing any trade to protect against common pitfalls in arbitrage trading.
 
 ## Arbitrage Conditions and Validations
 
 The arbitrage strategy is based on the following conditions and validations:
 
+NOTE: `validate_arbitrage_opportunity` function in `arb_strategy.py`
+
 - **Profitability Check**: The bot calculates potential profit by comparing prices on Binance and Uniswap. A trade is executed only if the profit exceeds the `min_profit_threshold` defined in the configuration.
 - **Slippage Tolerance**: The bot accounts for slippage, ensuring that the price movement during the trade does not erode the expected profit.
 - **Gas Fee Limit**: Trades are validated against a maximum gas fee limit to ensure that transaction costs do not outweigh the benefits.
 - **Order Size Limit**: The bot restricts the size of each order to a predefined limit to manage risk and liquidity.
-- **Simulation**: The bot uses simulations to validate arbitrage opportunities. For more details, refer to the `validate_arbitrage_opportunity` function in `arb_strategy.py`.
+- **Simulation**: The bot uses simulations to validate arbitrage opportunities. For more details, refer to the.
 
 ## Future Enhancements
 
@@ -30,7 +28,7 @@ The arbitrage strategy is based on the following conditions and validations:
 
 5. **Private Execution on Uniswap**: For MEV protection.
 
-6. **Greater Error Handling and Risk Management**: For example, to maintain baseline risks in each asset ideally at all times.
+6. **Better Error Handling and Risk Management**: For example, to maintain baseline risks in each asset ideally at all times.
 
 7. **Extensibility**: The code in its current form is not very extensible in terms of changing strategy or running strategy for multiple pairs. Although some modules were written with that in mind, others had to be written hastily due to lack of time.
 
