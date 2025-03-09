@@ -8,15 +8,15 @@ This project focuses on validating potential arbitrage trades between Binance an
 
 The arbitrage strategy is based on the following conditions and validations:
 
-NOTE: `validate_arbitrage_opportunity` function in `arb_strategy.py`
-
 - **Price dislocation Check**: The bot price dislocations b/w binance and uniswap. 
 - **Slippage Tolerance**: The bot accounts for slippage, ensuring that the price movement during the trade does not erode the expected profit.
 - **Gas Fee and transaction costs limit**: Trades are validated against a maximum gas fee limit to ensure that transaction costs do not outweigh the benefits.
 - **Order Size Limit**: The bot restricts the size of each order to a predefined limit to manage risk and liquidity.
 - **Simulation**: The bot uses simulations to validate arbitrage opportunities. For more details, refer to the.
 
-## Future Enhancements
+NOTE: Check `validate_arbitrage_opportunity` function in `arb_strategy.py`
+
+## Issues with code and suggested enhancements
 
 1. **Better Size Calculation**: Currently, an estimation is taken as TOB for Binance and 0.1% of reserve, ideal solution should be done using weighted orderbook price from binance, and [If 2nd is done] estimated best price from uniswap to maintain min profit rate defined in config.
 
