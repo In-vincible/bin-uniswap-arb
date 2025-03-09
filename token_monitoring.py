@@ -141,13 +141,13 @@ class TokenMonitor:
     def __init__(
         self, 
         token_addresses: List[str], 
-        web3: Web3, 
+        infura_url: str, 
         refresh_interval: int = 60,
         blocks_to_analyze: int = 10
     ):
         self.token_addresses = [Web3.toChecksumAddress(addr) for addr in token_addresses]
         self.refresh_interval = refresh_interval
-        self.web3 = web3
+        self.web3 = Web3(Web3.HTTPProvider(infura_url))
         self.blocks_to_analyze = blocks_to_analyze
 
         # Data storage
@@ -589,7 +589,7 @@ class TokenMonitor:
         """
         return self.network_congestion.get('is_congested', False)
     
-    def validate_token_transfer(self, token_address: str, amount: float, 
+    async def validate_token_transfer(self, token_address: str, amount: float, 
                                gas_price: Optional[int] = None,
                                max_allowed_wait_time: int = 120) -> Dict[str, any]:
         """
@@ -631,7 +631,8 @@ class TokenMonitor:
         
         # Check if the token is being monitored
         if token_address not in self.token_data:
-            result['reason'] = "Token not monitored by this instance"
+            result['reason'] = f"Token not monitored by this instance {token_address}"
+            self.token_data[token_address] = await self._analyze_token(token_address)
             return result
         
         # Check if network is up
@@ -672,7 +673,7 @@ class TokenMonitor:
                     f"amount: {amount}, estimated wait: {transfer_estimate.get('estimate_seconds')}s")
         return result
 
-    def validate_token_trade(self, token_address: str, amount: float,
+    async def validate_token_trade(self, token_address: str, amount: float,
                             slippage_threshold: float = 0.03,
                             max_congestion_level: int = 3000,
                             gas_price: Optional[int] = None) -> Dict[str, any]:
@@ -702,7 +703,7 @@ class TokenMonitor:
                 }
         """
         # First perform all the basic transfer validations
-        transfer_validation = self.validate_token_transfer(
+        transfer_validation = await self.validate_token_transfer(
             token_address=token_address,
             amount=amount,
             gas_price=gas_price
@@ -839,7 +840,7 @@ class TokenMonitor:
                     f"gas_price={optimal_gas_price} wei, profitable={profitable}")
         return result
 
-    def validate_arbitrage_opportunity(self, token_address: str, amount: float, 
+    async def validate_arbitrage_opportunity(self, token_address: str, amount: float, 
                                       expected_profit: float, gas_limit: int = 250000,
                                       max_wait_time: int = 30, transaction: Transaction = None) -> Dict[str, any]:
         """
@@ -862,7 +863,7 @@ class TokenMonitor:
                 - Network conditions
         """
         # First check if token trades are viable at all
-        trade_validation = self.validate_token_trade(
+        trade_validation = await self.validate_token_trade(
             token_address=token_address,
             amount=amount,
             slippage_threshold=0.005,  # Tighter slippage for arbitrage (0.5%)
@@ -1035,8 +1036,6 @@ if __name__ == "__main__":
     
     config = Config()
     
-    # Initialize Web3 using an Infura URL (replace with your actual project ID)
-    web3 = Web3(Web3.HTTPProvider(config.infura_url))
     
     # Example token addresses (Ethereum mainnet)
     tokens = [
@@ -1047,7 +1046,7 @@ if __name__ == "__main__":
     ]
     
     # Create the monitor instance
-    monitor = TokenMonitor(token_addresses=tokens, web3=web3, refresh_interval=60)
+    monitor = TokenMonitor(token_addresses=tokens, infura_url=config.infura_url, refresh_interval=60)
     
     async def main():
         # Start the monitoring task
@@ -1117,7 +1116,7 @@ if __name__ == "__main__":
                             data="0x"  # Empty data for this example
                         )
                         
-                        arb_validation = monitor.validate_arbitrage_opportunity(
+                        arb_validation = await monitor.validate_arbitrage_opportunity(
                             token_address=token_to_use,
                             amount=1000.0,  
                             expected_profit=5e16,  # 0.05 ETH profit in wei

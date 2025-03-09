@@ -31,9 +31,10 @@ class Binance:
                 'timestamp': None,
                 'last_update_time': None
             }
+        self.subscribe_market_data()
 
     # 1. Subscribe to market data via websocket
-    async def subscribe_market_data(self, callback=None):
+    def subscribe_market_data(self, callback=None):
         """
         For each symbol in instrument_list, subscribes to the ticker websocket.
         Stores price and timestamp data in memory.
@@ -90,6 +91,17 @@ class Binance:
             return self.market_data[symbol]
         return None
     
+    def get_current_base_price(self, symbol):
+        """
+        Get the current price of the base token in the pool.
+        
+        Returns:
+            float: The current price of the base token
+        """
+        if symbol in self.market_data:
+            return self.market_data[symbol]['price']
+        return None
+    
     def get_all_prices(self):
         """
         Get the latest prices for all subscribed instruments.
@@ -99,7 +111,6 @@ class Binance:
         """
         return self.market_data
 
-    # 2. Trade endpoint – place an order (market or limit)
     async def place_order(self, symbol: str, side: str, order_type: str, quantity, price=None):
         if order_type.upper() == "MARKET":
             order = await self.client.create_order(
@@ -121,11 +132,10 @@ class Binance:
             raise ValueError("Unsupported order type. Use MARKET or LIMIT.")
         return order
 
-    # 3. Deposit endpoint – get deposit address for an asset
     async def get_deposit_address(self, asset: str):
-        return await self.client.get_deposit_address(coin=asset)
+        address = await self.client.get_deposit_address(coin=asset)
+        return address['address']
 
-    # 4. Withdrawal endpoint – initiate a withdrawal request
     async def withdraw(self, asset: str, address: str, amount, network: str = None):
         params = {"asset": asset, "address": address, "amount": amount}
         if network:
@@ -142,10 +152,7 @@ class Binance:
     # 6. Get asset status (if deposits/withdrawals are suspended)
     async def get_asset_status(self, asset: str):
         details = await self.client.get_asset_details()
-        for d in details:
-            if d["asset"] == asset:
-                return d  # Contains keys like "depositStatus" and "withdrawStatus"
-        return None
+        return details.get(asset)
 
     # 7. Get current balances for a given list of assets
     async def get_balances(self, assets: list):
@@ -177,18 +184,29 @@ class Binance:
         self.stop_market_data_subscriptions()
         await self.client.close_connection()
     
-    async def get_tob_size(self, symbol: str):
+    async def get_tob_size(self, symbol: str, side: str):
         """
         Get the TOB size for a given symbol.
         """
-        return await self.client.get_tob_size(symbol=symbol)
+        # Get the order book depth to find the top of book size
+        depth = await self.client.get_order_book(symbol=symbol, limit=1)
+        if side == 'buy':
+            if depth and len(depth['bids']) > 0:
+                # Return the size at the best bid
+                return float(depth['bids'][0][1])
+            return 0.0  # Return 0 if no valid depth data
+        elif side == 'sell':
+            if depth and len(depth['asks']) > 0:
+                # Return the size at the best ask
+                return float(depth['asks'][0][1])
+        return 0.0  # Return 0 if no valid depth data
     
     async def verify_withdrawal_open(self, asset: str):
         """
         Verify if a withdrawal is currently open for a given asset.
         """
         asset_status = await self.get_asset_status(asset)
-        if asset_status and asset_status.get('withdrawStatus') == 'OK':
+        if asset_status and asset_status.get('withdrawStatus'):
             return True
         else:
             return False
@@ -198,7 +216,7 @@ class Binance:
         Verify if a deposit is currently open for a given asset.
         """
         asset_status = await self.get_asset_status(asset)
-        return asset_status and asset_status.get('depositStatus') == 'OK'
+        return asset_status and asset_status.get('depositStatus', False)
 
 
 # --- Async test code in __main__ ---
@@ -212,7 +230,7 @@ async def main():
 
 
     # Start the market data subscription - it will run continuously
-    await connector.subscribe_market_data()
+    connector.subscribe_market_data()
     print("Subscribed to market data. Running continuously...")
     
     # Wait for some initial data to come in

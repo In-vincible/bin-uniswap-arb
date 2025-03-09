@@ -3,7 +3,10 @@ from binance_connector import Binance
 from blocknative_simulator import BlocknativeSimulator
 from uniswap_connector import PoolMonitor
 from config import Config
-from token_monitoring import TokenMonitor
+from token_monitoring import TokenMonitor, Transaction
+import logging
+
+logger = logging.getLogger(__name__)
 
 class ArbitrageStrategy:
     def __init__(self):
@@ -24,25 +27,28 @@ class ArbitrageStrategy:
         self.quote_token_address = instrument_config['quote_token_address']
         self.arb_config = config.arb_config
         self.binance = Binance(config.binance_api_key, config.binance_api_secret, [instrument_config['instrument']])
-        self.uniswap = PoolMonitor(instrument_config['pool_address'], config.infura_url, config.wallet_private_key)
+        self.uniswap = PoolMonitor(instrument_config['pool_address'], config.infura_ws_url, config.wallet_private_key)
         self.token_monitor = TokenMonitor([instrument_config['base_token_address'], instrument_config['quote_token_address']], config.infura_url)
         self.blocknative_simulator = BlocknativeSimulator(config.blocknative_api_key)
     
-    def is_profitable(self, uniswap_price: float, binance_price: float):
+    def is_price_dislocated(self, uniswap_price: float, binance_price: float):
         """
         Check if the price difference is profitable.
         """
+        price_difference = abs(uniswap_price - binance_price) / min(uniswap_price, binance_price) * 10_000
+        logger.info(f"Price dislocation (bps): {round(price_difference, 2)}")
         if self.arb_config['execution_mode'] == 'both':
-            price_difference = abs(uniswap_price - binance_price) / min(uniswap_price, binance_price)
-            return price_difference > self.arb_config['min_profit_threshold']
+            return price_difference > self.arb_config['min_price_dislocation_bps']
         elif self.arb_config['execution_mode'] == 'binance_to_uniswap':
-            return uniswap_price > binance_price * (1 + self.arb_config['min_profit_threshold'] / 100)
+            return uniswap_price > binance_price * (1 + self.arb_config['min_price_dislocation_bps'] / 100)
         elif self.arb_config['execution_mode'] == 'uniswap_to_binance':
-            return binance_price > uniswap_price * (1 + self.arb_config['min_profit_threshold'] / 100)
+            return binance_price > uniswap_price * (1 + self.arb_config['min_price_dislocation_bps'] / 100)
     
     async def compute_arb_size(self, uniswap_price: float, binance_price: float, uniswap_trade_direction: str):
-        binance_tob_size = await self.binance.get_tob_size(self.instrument)
-        uniswap_tob_size = await self.uniswap.get_tob_size('sell')
+        binance_trade_direction = 'buy' if uniswap_trade_direction == 'sell' else 'sell'
+        binance_tob_size = await self.binance.get_tob_size(self.instrument, binance_trade_direction)
+        uniswap_tob_size = await self.uniswap.get_tob_size(uniswap_trade_direction)
+        logger.info(f"Binance TOB size: {binance_tob_size}, Uniswap TOB size: {uniswap_tob_size}")
         exchange_size = min(binance_tob_size, uniswap_tob_size)
         arb_size = min(exchange_size, self.arb_config['order_size_limit'])
         return arb_size
@@ -66,6 +72,77 @@ class ArbitrageStrategy:
         else:
             return await self.binance.verify_withdrawal_open(self.base_token)
 
+    async def _compute_expected_transfer_tx(self, arb_size: float, uniswap_trade_direction: str):
+        from_address = self.uniswap.wallet_address
+        to_address = await self.binance.get_deposit_address(self.base_token)
+        logger.info(f"uniswap wallet address: {from_address}, binance deposit address: {to_address}")
+        if uniswap_trade_direction == 'buy':
+            from_address, to_address = to_address, from_address
+        tx = Transaction(
+                            from_address=from_address,
+                            to_address=to_address,
+                            value=arb_size,
+                            data="0x"  # Empty data for this example
+                        )
+        return tx
+    
+    async def _validate_network_congestion_gas_costs_and_possible_slippage(self, arb_size: float, uniswap_trade_direction: str, expected_profit: float):
+        if self.arb_config['disable_network_level_validations']:
+            logger.info("Network level validations disabled")
+            return True
+        
+        tx = await self._compute_expected_transfer_tx(arb_size, uniswap_trade_direction)
+        opportunity = await self.token_monitor.validate_arbitrage_opportunity(
+                        token_address=self.base_token_address,
+                        amount=arb_size,
+                        gas_limit=self.arb_config['gas_fee_limit'],
+                        expected_profit=expected_profit,
+                        max_wait_time=self.arb_config['max_transfer_time_seconds'],
+                        transaction=tx
+                    )
+        logger.info(f"Token monitor validation: {opportunity}")
+        if not opportunity['valid']:
+            logger.info(f"Token monitor validation failed, reason: {opportunity['reason']}")
+            return False
+        
+        logger.info(f"Arbitrage opportunity valid! Use gas price: {opportunity['gas_price']} wei")
+        logger.info(f"Expected profit after gas: {opportunity['profit_after_gas']} wei")
+        logger.info(f"Estimated wait time: {opportunity['estimated_time']} seconds")
+        return True
+    
+    async def _simulate_transaction(self, arb_size: float, uniswap_trade_direction: str, expected_profit: float):
+        if self.arb_config['disable_blocknative_simulation']:
+            return True
+        
+        # Simulate the transaction
+        if uniswap_trade_direction == 'sell':
+            tx_data = {
+                "from": self.base_token_address,
+                "to": self.uniswap.wallet_address,
+                "value": arb_size,
+                "gas": self.arb_config['gas_fee_limit'],
+                "gasPrice": self.arb_config['gas_fee_limit']
+            }
+        else:
+            tx_data = {
+                "from": self.uniswap.wallet_address,
+                "to": self.base_token_address,
+                "value": arb_size,
+                "gas": self.arb_config['gas_fee_limit'],
+                "gasPrice": self.token_monitor.current_gas_price
+            }
+        simulation_result = self.blocknative_simulator.simulate_transaction(tx_data)
+        simulated_transaction_cost = simulation_result['total_estimated_cost']
+        base_token_decimals = await self.uniswap.get_base_token_decimals()
+        trade_size_wei = arb_size * (10**base_token_decimals)
+        transaction_cost_bps = simulated_transaction_cost / trade_size_wei * 10_000
+        logger.info(f'base token decimals: {base_token_decimals}, trade size wei: {trade_size_wei}, transaction cost: {simulated_transaction_cost}')
+        if transaction_cost_bps > self.arb_config['max_transaction_cost_bps']:
+            logger.info(f"Transaction cost (bps): {transaction_cost_bps} above threshold: {self.arb_config['max_transaction_cost_bps']}")
+            return False
+        
+        return True
+        
     
     async def validate_arbitrage_opportunity(self, uniswap_price: float, binance_price: float):
         """
@@ -88,50 +165,30 @@ class ArbitrageStrategy:
                  False otherwise
         """
         # Fundamental check to skip unnecessary checks
-        if not self.is_profitable(uniswap_price, binance_price):
+        if not self.is_price_dislocated(uniswap_price, binance_price):
             return False
         
         uniswap_trade_direction = self._uniswap_trade_direction(uniswap_price, binance_price)
         arb_size = await self.compute_arb_size(uniswap_price, binance_price, uniswap_trade_direction)
 
+        if arb_size == 0:
+            logger.info("No arbitrage size found")
+            return False
+        
         # Here we verify network congestion/gas costs/slippage thresholds/possible transfer issues with network and token
         expected_profit = arb_size * (uniswap_price - binance_price)
-        opportunity = self.token_monitor.validate_arbitrage_opportunity(
-                        token_address=self.base_token_address,
-                        amount=arb_size,
-                        expected_profit=expected_profit
-                    )
-        if not opportunity['is_valid']:
+        if not await self._validate_network_congestion_gas_costs_and_possible_slippage(arb_size, uniswap_trade_direction, expected_profit):
+            logger.info("Gas costs or slippage validation failed")
             return False
         
         # Binance transfer check
         if not await self._verify_binance_transfer_open(uniswap_price, binance_price):
+            logger.info("Binance transfer check failed")
             return False
         
         # Simulate the transaction
-        if uniswap_trade_direction == 'sell':
-            tx_data = {
-                "from": self.base_token_address,
-                "to": self.wallet_address,
-                "value": arb_size,
-                "gas": self.arb_config['gas_fee_limit'],
-                "gasPrice": self.arb_config['gas_fee_limit']
-            }
-        else:
-            tx_data = {
-                "from": self.wallet_address,
-                "to": self.base_token_address,
-                "value": arb_size,
-                "gas": self.arb_config['gas_fee_limit'],
-                "gasPrice": self.token_monitor.current_gas_price
-            }
-        simulation_result = self.blocknative_simulator.simulate_transaction(tx_data)
-        simulated_profit = None
-        if uniswap_trade_direction == 'sell':
-            simulated_profit = (simulation_result['estimated_price'] - expected_profit) / min(simulation_result['estimated_price'], expected_profit)
-        else:
-            simulated_profit = (expected_profit - simulation_result['estimated_price']) / min(simulation_result['estimated_price'], expected_profit)
-        if simulated_profit < self.arb_config['min_profit_threshold']:
+        if not await self._simulate_transaction(arb_size, uniswap_trade_direction, expected_profit):
+            logger.info("Transaction simulation validation failed")
             return False
         
         return True
@@ -146,12 +203,12 @@ class ArbitrageStrategy:
         await self.token_monitor.start_monitoring()
 
         while True:
-            binance_price = self.binance.get_latest_price('ETHUSDT')
-            uniswap_price = self.uniswap.get_current_price()
-
+            binance_price = self.binance.get_current_base_price(self.instrument)
+            uniswap_price = self.uniswap.get_current_base_price()
+            logger.info(f"Binance price: {binance_price}, Uniswap price: {uniswap_price}")
             if binance_price and uniswap_price:
                 if await self.validate_arbitrage_opportunity(uniswap_price, binance_price):
-                    print("Arbitrage opportunity detected: Buy on Binance, Sell on Uniswap")
+                    logger.info("Arbitrage opportunity detected: Buy on Binance, Sell on Uniswap")
 
             await asyncio.sleep(1)  # Adjust the frequency as needed
 
@@ -165,7 +222,7 @@ class ArbitrageStrategy:
 
 # Example usage
 async def main():
-    strategy = ArbitrageStrategy('ETHUSDT', 'uniswap_pool_address', ['token_address'])
+    strategy = ArbitrageStrategy()
     await strategy.monitor_prices()
 
 if __name__ == "__main__":

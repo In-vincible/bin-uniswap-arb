@@ -474,8 +474,8 @@ class PoolMonitor:
             
             # Log the reserves for debugging
             logger.info(f"Calculated reserves using whitepaper formula:")
-            logger.info(f"  {self.token0_symbol} reserves: {reserve0_hr:.2f}")
-            logger.info(f"  {self.token1_symbol} reserves: {reserve1_hr:.2f}")
+            logger.info(f"Hourly {self.token0_symbol} reserves: {reserve0_hr:.2f}")
+            logger.info(f"Hourly {self.token1_symbol} reserves: {reserve1_hr:.2f}")
             
             # Update the cache
             timestamp = int(time.time())
@@ -538,6 +538,15 @@ class PoolMonitor:
         
         # If no cache entry exists, update it
         return self._update_price_cache()
+    
+    def get_current_base_price(self):
+        """
+        Get the current price of the base token in the pool.
+        
+        Returns:
+            float: The current price of the base token
+        """
+        return self.get_current_price()['token1_price']
     
     def _format_number(self, number):
         """
@@ -625,7 +634,16 @@ class PoolMonitor:
         except Exception as e:
             logger.error(f"Error in background price update loop: {e}")
             self.background_updates_running = False
-            
+    
+    async def get_base_token_decimals(self):
+        """
+        Get the decimals of the base token.
+        
+        Returns:
+            int: The number of decimals of the base token
+        """
+        return self.token1_decimals
+    
     async def process_swap_event(self, event):
         """
         Process a swap event from the pool.
@@ -1337,18 +1355,20 @@ class PoolMonitor:
             float: Estimated TOB size in base token units
         """
         try:
-            # Get current pool reserves
-            reserves = await self.get_reserves()
-            if not reserves:
+            # WHY: Using cached values avoids unnecessary RPC calls and calculations
+            # If not in cache, we return 0 as a safe default
+            price_cache = self.get_current_price()
+            reserve0, reserve1 = price_cache.get("reserve0"), price_cache.get("reserve1")
+            if reserve0 is None or reserve1 is None:
                 return 0
             
             token_we_are_getting = self.token0_address if direction == 'sell' else self.token1_address
             is_base_token = token_we_are_getting == self.token0_address
                 
             if is_base_token:
-                tob_size = reserves[0] * 0.001
+                tob_size = reserve0 * 0.001
             else:
-                tob_size = reserves[1] * 0.001
+                tob_size = reserve1 * 0.001
             
             # Cap at reasonable size
             MAX_TOB = 10.0  # Maximum 10 base tokens
@@ -1364,6 +1384,7 @@ class PoolMonitor:
             return tob_size
             
         except Exception as e:
+            logger.error(f"Stack Trace: {traceback.format_exc()}")
             logger.error(f"Error getting TOB size: {e}")
             return 0
 
