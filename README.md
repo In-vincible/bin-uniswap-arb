@@ -20,19 +20,21 @@ NOTE: `validate_arbitrage_opportunity` function in `arb_strategy.py`
 
 1. **Better Size Calculation**: Currently, an estimation is taken as TOB for Binance and 0.1% of reserve.
 
-2. **Blocknative Simulation Caching**: Simulations could be cached to run asynchronously for a series of sizes, e.g., 10 USDC, 50 USDC, 100 USDC, 200 USDC...10k USDC, both for buy/sell. This way, when running simulations while validating, we can simply take the expected price of the size above `arb_size` from the tier of sizes. Similarly, gas estimates in `token_monitoring` can be cached. The only problem is they need to be cached in size tiers to have any reasonable accuracy, just like Blocknative. This and a few other caching strategies will make the detection and validation part a microsecond operation.
+2. **Blocknative Simulation Caching**: Simulations could be cached to run asynchronously for a series of sizes, e.g., 10 USDC, 50 USDC, 100 USDC, 200 USDC...10k USDC, both for buy/sell. This way, when running simulations while validating, we can simply take the expected price of the size above `arb_size` from the tier of sizes. Similarly, gas estimates in `token_monitoring` can be cached. The only problem is they need to be cached in size tiers to have any reasonable accuracy, just like Blocknative. [This and a few other caching strategies will make the detection and validation part a microsecond operation.]
 
 3. **Baseline Risk**: This is the usual way to do it, but due to time constraints, it can't be done. Basically, let's say we are interested in arbitrage of a token with positive funding. We can have a delta-neutral position while getting paid funding, and we have a ratio of sizes spread across Uniswap and Binance. This allows us to move really fast when arbitrage arises, as we don't have to wait for transfers.
 
-4. **Usage of Loans**: Very useful during arbitrage if available. If the latency of detection and validation is super low, we have a very good chance of getting a loan at reasonable prices if arbitrage is not due to some exogenous factor.
+4. [Pre-requisite 3] Passive sell order we put at very far from top of the book on binance [wicks] - very useful if a huge move happens on binance and we can instantly hedge that on uniswap. [wicks statiscally make money most of the times]
 
-5. **Private Execution on Uniswap**: For MEV protection.
+5. **Usage of Loans**: Very useful during arbitrage if available. If the latency of detection and validation is super low, we have a very good chance of getting a loan at reasonable prices if arbitrage is not due to some exogenous factor.
 
-6. **Better Error Handling and Risk Management**: For example, to maintain baseline risks in each asset ideally at all times.
+6. **Private Execution on Uniswap**: For MEV protection.
 
-7. **Extensibility**: The code in its current form is not very extensible in terms of changing strategy or running strategy for multiple pairs. Although some modules were written with that in mind, others had to be written hastily due to lack of time.
+7. **Better Error Handling and Risk Management**: For example, to maintain baseline risks in each asset ideally at all times.
 
-8. **Multi-hop Trades on Uniswap**: Basically triangular arbitrage or more than 2-step arbitrages. It is possible with atomicity provided by Uniswap in terms of packing all Uniswap transactions together.
+8. **Extensibility**: The code in its current form is not very extensible in terms of changing strategy or running strategy for multiple pairs. Although some modules were written with that in mind, others had to be written hastily due to lack of time.
+
+9. **Multi-hop Trades on Uniswap**: Basically triangular arbitrage or more than 2-step arbitrages. It is possible with atomicity provided by Uniswap in terms of packing all Uniswap transactions together.
 
 ## Configuration File (`config.json`)
 
