@@ -1,14 +1,16 @@
 import asyncio
-import os
+import logging
 import time
 from binance import AsyncClient, BinanceSocketManager
 from config import Config
 
+logger = logging.getLogger(__name__)
+
 class Binance:
-    def __init__(self, api_key: str, secret_key: str, instrument_list: list):
+    def __init__(self, api_key: str, secret_key: str, instrument: str):
         self.api_key = api_key
         self.secret_key = secret_key
-        self.instrument_list = instrument_list
+        self.instrument = instrument
         self.client = None
         self.bsm = None
         # Dictionary to store latest price data for each instrument
@@ -25,12 +27,11 @@ class Binance:
         self.bsm = BinanceSocketManager(self.client)
         
         # Initialize market data structure for each instrument
-        for symbol in self.instrument_list:
-            self.market_data[symbol] = {
-                'price': None,
-                'timestamp': None,
-                'last_update_time': None
-            }
+        self.market_data[self.instrument] = {
+            'price': None,
+            'timestamp': None,
+            'last_update_time': None
+        }
         self.subscribe_market_data()
 
     # 1. Subscribe to market data via websocket
@@ -45,22 +46,21 @@ class Binance:
         """
         self.subscription_tasks = []  # Clear any existing tasks
         
-        for symbol in self.instrument_list:
-            socket = self.bsm.symbol_ticker_socket(symbol)
+        socket = self.bsm.symbol_ticker_socket(self.instrument)
             
-            async def handle_socket(sock, sym):
-                async with sock as stream:
-                    while True:
-                        msg = await stream.recv()
-                        # Update internal market data
-                        self._update_market_data(sym, msg)
-                        # Call external callback if provided
-                        if callback:
-                            callback(msg)
-            
-            # Create task with the symbol passed as an argument
-            task = asyncio.create_task(handle_socket(socket, symbol))
-            self.subscription_tasks.append(task)
+        async def handle_socket(sock, symbol):
+            async with sock as stream:
+                while True:
+                    msg = await stream.recv()
+                    # Update internal market data
+                    self._update_market_data(symbol, msg)
+                    # Call external callback if provided
+                    if callback:
+                        callback(msg)
+        
+        # Create task with the symbol passed as an argument
+        task = asyncio.create_task(handle_socket(socket, self.instrument))
+        self.subscription_tasks.append(task)
         
         # No need to return tasks as they're stored in self.subscription_tasks
     
@@ -236,7 +236,7 @@ class Binance:
         asset_status = await self.get_asset_status(asset)
         return asset_status and asset_status.get('depositStatus', False)
 
-    async def execute_trade(self, trade_direction, trade_size, arb_instrument):
+    async def execute_trade(self, trade_direction, trade_size):
         """
         Execute a trade on Binance.
 
@@ -248,9 +248,44 @@ class Binance:
         Returns:
             dict: Trade details
         """
-        # Implement trade execution logic here
-        # This is a placeholder implementation
-        return {"status": "success", "trade_size": trade_size}
+        try:
+            # Validate inputs
+            if trade_direction not in ['buy', 'sell']:
+                raise ValueError(f"Invalid trade direction: {trade_direction}. Must be 'buy' or 'sell'")
+            if trade_size <= 0:
+                raise ValueError(f"Invalid trade size: {trade_size}. Must be positive")
+
+            # Convert direction to Binance order side
+            side = trade_direction.upper()
+
+            # Create order parameters
+            order_params = {
+                'symbol': self.instrument,
+                'side': side,
+                'type': 'MARKET',  # Using market orders for immediate execution
+                'quantity': trade_size
+            }
+
+            # Execute the trade
+            logger.info(f"Executing trade: {order_params}")
+            order = await self.client.create_order(**order_params)
+
+            # Return trade details
+            return {
+                'status': 'success',
+                'order_id': order['orderId'],
+                'trade_size': float(order['executedQty']),
+                'avg_price': float(order['cummulativeQuoteQty']) / float(order['executedQty']),
+                'timestamp': order['transactTime']
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to execute trade: {str(e)}")
+            return {
+                'status': 'error',
+                'error': str(e),
+                'trade_size': 0
+            }
 
     async def confirm_trade(self, trade):
         """
@@ -457,10 +492,10 @@ class Binance:
 # --- Async test code in __main__ ---
 async def main():
     config = Config()
-    instrument_list = ["ETHUSDC"]
+    instrument = "ETHUSDC"
     asset_list = ["ETH", "USDC"]
 
-    connector = Binance(config.binance_api_key, config.binance_api_secret, instrument_list)
+    connector = Binance(config.binance_api_key, config.binance_api_secret, instrument)
     await connector.init()
 
 

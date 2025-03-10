@@ -28,7 +28,7 @@ class ArbitrageStrategy:
         self.base_token_address = instrument_config['base_token_address']
         self.quote_token_address = instrument_config['quote_token_address']
         self.arb_config = config.arb_config
-        self.binance = Binance(config.binance_api_key, config.binance_api_secret, [instrument_config['binance_instrument']])
+        self.binance = Binance(config.binance_api_key, config.binance_api_secret, instrument_config['binance_instrument'])
         self.uniswap = PoolMonitor(instrument_config['uniswap_instrument'], config.infura_ws_url, config.wallet_private_key)
         self.token_monitor = TokenMonitor([instrument_config['base_token_address'], instrument_config['quote_token_address']], config.infura_url)
         self.blocknative_simulator = BlocknativeSimulator(config.blocknative_api_key)

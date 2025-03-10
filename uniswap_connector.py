@@ -549,7 +549,8 @@ class PoolMonitor:
                 'reserve0': reserve0,
                 'reserve1': reserve1,
                 'reserve0_hr': reserve0_hr,
-                'reserve1_hr': reserve1_hr
+                'reserve1_hr': reserve1_hr,
+                'base_token_reserve': reserve0_hr if self.base_token_info['symbol'] == self.token0_info['symbol'] else reserve1_hr
             }
             
             return self._price_cache[self.pool_address]
@@ -685,7 +686,7 @@ class PoolMonitor:
         Returns:
             int: The number of decimals of the base token
         """
-        return self.token1_decimals
+        return self.base_token_info['decimals']
     
     async def process_swap_event(self, event):
         """
@@ -1474,28 +1475,15 @@ class PoolMonitor:
             # WHY: Using cached values avoids unnecessary RPC calls and calculations
             # If not in cache, we return 0 as a safe default
             price_cache = self.get_current_price()
-            reserve0, reserve1 = price_cache.get("reserve0"), price_cache.get("reserve1")
-            if reserve0 is None or reserve1 is None:
-                return 0
-            
-            token_we_are_getting = self.token0_info['address'] if direction == 'sell' else self.token1_info['address']
-            is_base_token = token_we_are_getting == self.token0_info['address']
-                
-            if is_base_token:
-                tob_size = reserve0 * 0.001
-            else:
-                tob_size = reserve1 * 0.001
-            
+            tob_size = price_cache['base_token_reserve'] * 0.05
+
             # Cap at reasonable size
             MAX_TOB = 10.0  # Maximum 10 base tokens
             tob_size = min(tob_size, MAX_TOB)
 
             # convert to base token units
-            if is_base_token:
-                current_price = self.get_current_price()['token0_price']
-                tob_size = tob_size / (10 ** self.token0_info['decimals']) / current_price
-            else:
-                tob_size = tob_size / (10 ** self.token1_info['decimals'])
+            current_price = self.get_current_price()['token0_price']
+            tob_size = tob_size / (10 ** self.token0_info['decimals']) / current_price
             
             return tob_size
             
@@ -1504,7 +1492,7 @@ class PoolMonitor:
             logger.error(f"Error getting TOB size: {e}")
             return 0
 
-    async def execute_trade(self, trade_direction, trade_size, arb_instrument):
+    async def execute_trade(self, trade_direction, trade_size):
         """
         Execute a trade on Uniswap.
 
@@ -1516,12 +1504,7 @@ class PoolMonitor:
         Returns:
             dict: Trade details
         """
-        if arb_instrument not in [self.token0_info['symbol'], self.token1_info['symbol']]:
-            raise ValueError(f"Invalid instrument: {arb_instrument}, instruemnt not found in pool. (pool: {self.instrument})")
-        
-        # Implement trade execution logic here
-        # This is a placeholder implementation
-        return {"status": "success", "trade_size": trade_size}
+        return await self.swap_instrument(trade_size, self.base_token_info['address'], is_exact_input=True, slippage=0.1, deadline=600)
 
     async def confirm_trade(self, trade):
         """

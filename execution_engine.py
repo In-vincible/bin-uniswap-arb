@@ -17,7 +17,7 @@ class ExecutionEngine:
         """
         try:
             # Step 1: Execute buy
-            buy_trade = await buy_exchange.execute_trade('buy', arb_size, arb_instrument)
+            buy_trade = await buy_exchange.execute_trade('buy', arb_size)
             logger.info(f"Buy executed: {buy_trade}")
 
             # Step 2: Confirm buy execution
@@ -45,7 +45,7 @@ class ExecutionEngine:
                 return False
 
             # Step 5: Execute sell on sell venue
-            sell_trade = await sell_exchange.execute_trade('sell', confirmed_transfer_size, arb_instrument)
+            sell_trade = await sell_exchange.execute_trade('sell', confirmed_transfer_size)
             logger.info(f"Sell executed: {sell_trade}")
 
             return True
@@ -75,11 +75,11 @@ class ExecutionEngine:
 
             # Sell any holdings if above min_rollback_size
             if buy_balance > min_rollback_size:
-                await buy_exchange.execute_trade('sell', buy_balance, arb_instrument)
+                await buy_exchange.execute_trade('sell', buy_balance)
                 logger.info(f"Sold {buy_balance} of {arb_instrument} on buy exchange.")
 
             if sell_balance > min_rollback_size:
-                await sell_exchange.execute_trade('sell', sell_balance, arb_instrument)
+                await sell_exchange.execute_trade('sell', sell_balance)
                 logger.info(f"Sold {sell_balance} of {arb_instrument} on sell exchange.")
 
         except Exception as rollback_error:
