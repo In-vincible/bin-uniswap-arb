@@ -12,7 +12,7 @@ The arbitrage strategy is based on the following conditions and validations:
 - **Slippage Tolerance**: The bot accounts for slippage, ensuring that the price movement during the trade does not erode the expected profit.
 - **Gas Fee and transaction costs limit**: Trades are validated against a maximum gas fee limit to ensure that transaction costs do not outweigh the benefits.
 - **Order Size Limit**: The bot restricts the size of each order to a predefined limit to manage risk and liquidity.
-- **Simulation**: The bot uses simulations to validate arbitrage opportunities. For more details, refer to the.
+- **Simulation**: block native simulation to get more accurate transaction costs.
 
 NOTE: Check `validate_arbitrage_opportunity` function in `arb_strategy.py`
 
