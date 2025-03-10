@@ -143,3 +143,13 @@ The `arb_strategy` module implements the core logic for identifying and executin
 ### Blocknative Simulator
 
 The Blocknative simulator is used to simulate Ethereum transactions and network conditions. It provides insights into potential transaction outcomes, helping to optimize gas fees and execution strategies. This tool is essential for testing and refining the bot's performance in a controlled environment.
+
+### Execution Engine
+
+To execute arb (buy => transfer => sell) and rollback in cases when required.
+
+### Config
+
+To load config.
+
+
