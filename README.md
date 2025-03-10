@@ -126,4 +126,20 @@ The `ExecutionEngine` ensures atomicity in arbitrage operations, meaning that ei
 
 ### Token Monitoring
 
-The `
+The `token_monitoring` module is responsible for tracking token prices and network conditions. It provides real-time data on token balances, network congestion, and gas prices, which are crucial for making informed trading decisions.
+
+### Binance Connector
+
+The `binance_connector` module interfaces with the Binance API to fetch market data and execute trades. It manages market data subscriptions and provides methods for placing orders, withdrawing funds, and checking account balances.
+
+### Uniswap Connector
+
+The `uniswap_connector` module interacts with the Uniswap protocol to monitor pool prices and execute swaps. It handles the initialization of pool and token information, price, liquidity, reserve calculations and balance updates. [All calculations as per uniswap V3 white paper]
+
+### Arbitrage Strategy
+
+The `arb_strategy` module implements the core logic for identifying and executing arbitrage opportunities. It integrates data from both Binance and Uniswap connectors and uses the `token_monitoring` module to validate trades against current network conditions.
+
+### Blocknative Simulator
+
+The Blocknative simulator is used to simulate Ethereum transactions and network conditions. It provides insights into potential transaction outcomes, helping to optimize gas fees and execution strategies. This tool is essential for testing and refining the bot's performance in a controlled environment.
