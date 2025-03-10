@@ -85,7 +85,8 @@ The `config.json` file contains essential parameters and API keys required for t
         "max_transfer_time_seconds": 10,
         "max_transaction_cost_bps": 50,
         "disable_blocknative_simulation": false,
-        "disable_network_level_validations": false
+        "disable_network_level_validations": false,
+        "min_rollback_order_size": 0.001
     }
 }
 ```
@@ -95,28 +96,34 @@ execution_mode can be:
 - "binance_to_uniswap": buy on binance and sell on uniswap
 - "uniswap_to_binance": buy on uniswap and sell on binance
 
+## Arbitrage Configuration Parameters
+
+The `arb_config` section in the `config.json` file defines the parameters for the arbitrage strategy:
+
+- **min_price_dislocation_bps**: Minimum basis points of price dislocation required to consider an arbitrage opportunity.
+- **min_profit_threshold**: Minimum profit threshold in percentage required to execute an arbitrage trade.
+- **slippage_tolerance**: Maximum acceptable slippage in percentage during trade execution.
+- **gas_fee_limit**: Maximum gas fee allowed for executing trades, in Gwei.
+- **order_size_limit**: Maximum size of each order to manage risk and liquidity.
+- **execution_mode**: Determines the direction of arbitrage execution. Options are "both", "binance_to_uniswap", or "uniswap_to_binance".
+- **max_transfer_time_seconds**: Maximum time allowed for asset transfers between exchanges, in seconds.
+- **max_transaction_cost_bps**: Maximum transaction cost in basis points allowed for executing trades.
+- **disable_blocknative_simulation**: Boolean flag to disable Blocknative simulation for transaction validation.
+- **disable_network_level_validations**: Boolean flag to disable network-level validations such as gas costs and slippage.
+- **min_rollback_order_size**: Minimum order size required to trigger a rollback in case of execution failure.
+
+## Arbitrage Execution and Rollback
+
+The arbitrage execution process is managed by the `ExecutionEngine` class, located in the `execution_engine.py` file. This class handles the entire lifecycle of an arbitrage trade, including:
+
+1. **Execution**: The engine executes buy and sell trades on the specified exchanges, ensuring that each step is confirmed before proceeding.
+2. **Verification**: After each trade and transfer, the engine verifies the operation's success. If any step fails, it initiates a rollback.
+3. **Rollback**: In case of failure, the engine unwinds the arbitrage position by selling any acquired assets and canceling pending trades or transfers. This ensures that the system returns to a stable state.
+
+The `ExecutionEngine` ensures atomicity in arbitrage operations, meaning that either all steps are completed successfully, or none are, thus protecting against partial execution risks.
+
 ## Module Descriptions
 
 ### Token Monitoring
 
-The `token_monitoring` module is responsible for tracking token prices and network conditions. It provides real-time data on token balances, network congestion, and gas prices, which are crucial for making informed trading decisions.
-
-### Binance Connector
-
-The `binance_connector` module interfaces with the Binance API to fetch market data and execute trades. It manages market data subscriptions and provides methods for placing orders, withdrawing funds, and checking account balances.
-
-### Uniswap Connector
-
-The `uniswap_connector` module interacts with the Uniswap protocol to monitor pool prices and execute swaps. It handles the initialization of pool and token information, price, liquidity, reserve calculations and balance updates. [All calculations as per uniswap V3 white paper]
-
-### Arbitrage Strategy
-
-The `arb_strategy` module implements the core logic for identifying and executing arbitrage opportunities. It integrates data from both Binance and Uniswap connectors and uses the `token_monitoring` module to validate trades against current network conditions.
-
-### Blocknative Simulator
-
-The Blocknative simulator is used to simulate Ethereum transactions and network conditions. It provides insights into potential transaction outcomes, helping to optimize gas fees and execution strategies. This tool is essential for testing and refining the bot's performance in a controlled environment.
-
----
-
-This README now includes the specified future enhancements and rearranged sections as requested. Let me know if you need any further modifications or additional details!
+The `

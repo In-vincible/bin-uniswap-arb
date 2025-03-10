@@ -6,7 +6,6 @@ from config import Config
 class BlocknativeSimulator:
     def __init__(self, api_key: str):
         self.api_key = api_key
-        # Replace the endpoint below with the current simulation endpoint per Blocknative docs.
         self.simulation_endpoint = "https://api.blocknative.com/transaction-simulation/v1/simulate"
         self.headers = {
             "Authorization": self.api_key,
@@ -58,6 +57,76 @@ class BlocknativeSimulator:
                 raise Exception("No block prices available in the response.")
         except requests.exceptions.RequestException as e:
             raise Exception(f"Failed to fetch gas prices: {str(e)}")
+
+    def simulate_uniswap_swap(self, tx_data: dict, pool_address: str, amount_in: float, token_in: str, token_out: str):
+        """
+        Simulate a Uniswap swap transaction using Blocknative's API.
+        
+        Parameters:
+            tx_data (dict): Base transaction object with from/to addresses and gas parameters
+            pool_address (str): Address of the Uniswap pool
+            amount_in (float): Input amount for the swap
+            token_in (str): Address of input token
+            token_out (str): Address of output token
+            
+        Returns:
+            dict: Simulation results including estimated costs and output amount
+        """
+        # Endpoint for simulating contract interactions
+        simulation_endpoint = "https://api.blocknative.com/simulate"
+
+        # Encode the swap function call
+        # This is a simplified example - actual encoding would depend on the specific Uniswap function
+        swap_data = {
+            "methodName": "swap",
+            "params": {
+                "amountIn": amount_in,
+                "tokenIn": token_in,
+                "tokenOut": token_out,
+                "recipient": tx_data["from"]
+            }
+        }
+
+        # Build simulation payload
+        payload = {
+            "system": "ethereum", 
+            "network": "main",
+            "transaction": {
+                **tx_data,
+                "to": pool_address,
+                "data": swap_data
+            }
+        }
+
+        try:
+            response = requests.post(
+                simulation_endpoint, 
+                headers=self.headers,
+                json=payload
+            )
+            response.raise_for_status()
+            simulation_data = response.json()
+
+            # Extract relevant simulation results
+            result = {
+                'success': simulation_data.get('success', False),
+                'estimated_gas_used': simulation_data.get('gasUsed'),
+                'estimated_output': simulation_data.get('outputAmount'),
+                'total_cost': simulation_data.get('totalCost'),
+                'simulation_status': simulation_data.get('status'),
+                'error': simulation_data.get('error')
+            }
+
+            # Get current gas prices to estimate total transaction cost
+            gas_price_data = self.simulate_transaction(tx_data)
+            result['total_estimated_cost'] = (
+                result['estimated_gas_used'] * gas_price_data['estimated_price']
+            )
+
+            return result
+
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"Failed to simulate Uniswap swap: {str(e)}")
 
 # --- Simple test code in __main__ ---
 if __name__ == "__main__":

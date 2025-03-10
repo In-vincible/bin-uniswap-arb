@@ -1,6 +1,7 @@
 import asyncio
 from binance_connector import Binance
 from blocknative_simulator import BlocknativeSimulator
+from execution_engine import ExecutionEngine
 from uniswap_connector import PoolMonitor
 from config import Config
 from token_monitoring import TokenMonitor, Transaction
@@ -192,8 +193,31 @@ class ArbitrageStrategy:
             return False
         
         return True
-        
-
+    
+    async def get_arb_parameters(self, uniswap_price: float, binance_price: float):
+        uniswap_trade_direction = self._uniswap_trade_direction(uniswap_price, binance_price)
+        arb_size = await self.compute_arb_size(uniswap_price, binance_price, uniswap_trade_direction)
+        if uniswap_trade_direction == 'sell':
+            return {
+                'buy_exchange': self.binance,
+                'sell_exchange': self.uniswap,
+                'arb_size': arb_size,
+                'arb_instrument': self.base_token,
+                'min_rollback_size': self.arb_config['min_rollback_order_size']
+            }
+        else:
+            return {
+                'buy_exchange': self.uniswap,
+                'sell_exchange': self.binance,
+                'arb_size': arb_size,
+                'arb_instrument': self.base_token,
+                'min_rollback_size': self.arb_config['min_rollback_order_size']
+            }
+    
+    async def execute_arb(self, binance_price: float, uniswap_price: float):
+        arb_parameters = await self.get_arb_parameters(binance_price, uniswap_price)
+        await ExecutionEngine.execute_arb(arb_parameters['buy_exchange'], arb_parameters['sell_exchange'], arb_parameters['arb_size'], arb_parameters['arb_instrument'], arb_parameters['min_rollback_size'])
+    
     async def monitor_prices(self):
         """
         Monitor prices on Binance and Uniswap and detect arbitrage opportunities.
@@ -208,7 +232,7 @@ class ArbitrageStrategy:
             logger.info(f"Binance price: {binance_price}, Uniswap price: {uniswap_price}")
             if binance_price and uniswap_price:
                 if await self.validate_arbitrage_opportunity(uniswap_price, binance_price):
-                    logger.info("Arbitrage opportunity detected: Buy on Binance, Sell on Uniswap")
+                    await self.execute_arb(binance_price, uniswap_price)
 
             await asyncio.sleep(1)  # Adjust the frequency as needed
 

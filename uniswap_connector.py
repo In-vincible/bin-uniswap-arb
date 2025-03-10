@@ -9,7 +9,7 @@ import logging
 import argparse
 from web3 import Web3
 from web3.middleware import geth_poa_middleware
-from unittest.mock import AsyncMock
+
 
 # Configure logging
 logging.basicConfig(
@@ -21,6 +21,15 @@ logger = logging.getLogger(__name__)
 
 # Default ETH/USDC pool address
 DEFAULT_POOL_ADDRESS = "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"  # ETH/USDC (0.05%)
+
+TOKEN_ADDRESS_MAP = {
+    "ETH": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+    "USDC": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+    "USDT": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+    "DAI": "0x6B175474E89094C44Da98b954EedeAC495271d0F",
+    "WETH": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+    "WBTC": "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"
+}
 
 
 class PoolMonitor:
@@ -90,6 +99,30 @@ class PoolMonitor:
         This method sets up the Web3 connection, loads the pool contract,
         and initializes token information.
         """
+        # ERC20 ABI for getting token information
+        # Current minimal ERC20 ABI - only has symbol and decimals functions
+        # erc20_abi = json.loads('''[
+        #     {"constant":true,"inputs":[],"name":"symbol","outputs":[{"name":"","type":"string"}],"payable":false,"stateMutability":"view","type":"function"},
+        #     {"constant":true,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"payable":false,"stateMutability":"view","type":"function"}
+        # ]''')
+
+        # ABI with all functions
+        erc20_abi = json.loads('''[
+            {"constant":true,"inputs":[],"name":"symbol","outputs":[{"name":"","type":"string"}],"payable":false,"stateMutability":"view","type":"function"},
+            {"constant":true,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"payable":false,"stateMutability":"view","type":"function"},
+            {"constant":true,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"payable":false,"stateMutability":"view","type":"function"},
+            {"constant":false,"inputs":[{"name":"_to","type":"address"},{"name":"_value","type":"uint256"}],"name":"transfer","outputs":[{"name":"success","type":"bool"}],"payable":false,"stateMutability":"nonpayable","type":"function"},
+            {"constant":false,"inputs":[{"name":"_spender","type":"address"},{"name":"_value","type":"uint256"}],"name":"approve","outputs":[{"name":"success","type":"bool"}],"payable":false,"stateMutability":"nonpayable","type":"function"},
+            {"constant":true,"inputs":[{"name":"_owner","type":"address"},{"name":"_spender","type":"address"}],"name":"allowance","outputs":[{"name":"remaining","type":"uint256"}],"payable":false,"stateMutability":"view","type":"function"},
+            {"constant":false,"inputs":[{"name":"_from","type":"address"},{"name":"_to","type":"address"},{"name":"_value","type":"uint256"}],"name":"transferFrom","outputs":[{"name":"success","type":"bool"}],"payable":false,"stateMutability":"nonpayable","type":"function"},
+            {"payable":true,"stateMutability":"payable","type":"fallback"},
+            {"constant":false,"inputs":[],"name":"deposit","outputs":[],"payable":true,"stateMutability":"payable","type":"function"},
+            {"constant":false,"inputs":[{"name":"wad","type":"uint256"}],"name":"withdraw","outputs":[],"payable":false,"stateMutability":"nonpayable","type":"function"}
+        ]''')
+        
+        # Initialize token contracts
+        self.erc20_abi = erc20_abi
+        
         # Load pool contract ABI
         pool_abi = json.loads('''[
             {"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"sender","type":"address"},{"indexed":true,"internalType":"address","name":"recipient","type":"address"},{"indexed":false,"internalType":"int256","name":"amount0","type":"int256"},{"indexed":false,"internalType":"int256","name":"amount1","type":"int256"},{"indexed":false,"internalType":"uint160","name":"sqrtPriceX96","type":"uint160"},{"indexed":false,"internalType":"uint128","name":"liquidity","type":"uint128"},{"indexed":false,"internalType":"int24","name":"tick","type":"int24"}],"name":"Swap","type":"event"},
@@ -100,7 +133,11 @@ class PoolMonitor:
             {"inputs":[],"name":"liquidity","outputs":[{"internalType":"uint128","name":"","type":"uint128"}],"stateMutability":"view","type":"function"},
             {"inputs":[],"name":"tickSpacing","outputs":[{"internalType":"int24","name":"","type":"int24"}],"stateMutability":"view","type":"function"},
             {"inputs":[{"internalType":"int24","name":"tick","type":"int24"}],"name":"ticks","outputs":[{"internalType":"uint128","name":"liquidityGross","type":"uint128"},{"internalType":"int128","name":"liquidityNet","type":"int128"},{"internalType":"uint256","name":"feeGrowthOutside0X128","type":"uint256"},{"internalType":"uint256","name":"feeGrowthOutside1X128","type":"uint256"},{"internalType":"int56","name":"tickCumulativeOutside","type":"int56"},{"internalType":"uint160","name":"secondsPerLiquidityOutsideX128","type":"uint160"},{"internalType":"uint32","name":"secondsOutside","type":"uint32"},{"internalType":"bool","name":"initialized","type":"bool"}],"stateMutability":"view","type":"function"},
-            {"inputs":[{"internalType":"int16","name":"wordPosition","type":"int16"}],"name":"tickBitmap","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"}
+            {"inputs":[{"internalType":"int16","name":"wordPosition","type":"int16"}],"name":"tickBitmap","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+            {"inputs":[{"components":[{"internalType":"address","name":"tokenIn","type":"address"},{"internalType":"address","name":"tokenOut","type":"address"},{"internalType":"uint24","name":"fee","type":"uint24"},{"internalType":"address","name":"recipient","type":"address"},{"internalType":"uint256","name":"deadline","type":"uint256"},{"internalType":"uint256","name":"amountIn","type":"uint256"},{"internalType":"uint256","name":"amountOutMinimum","type":"uint256"},{"internalType":"uint160","name":"sqrtPriceLimitX96","type":"uint160"}],"internalType":"struct ISwapRouter.ExactInputSingleParams","name":"params","type":"tuple"}],"name":"exactInputSingle","outputs":[{"internalType":"uint256","name":"amountOut","type":"uint256"}],"stateMutability":"payable","type":"function"},
+            {"inputs":[{"components":[{"internalType":"address","name":"tokenIn","type":"address"},{"internalType":"address","name":"tokenOut","type":"address"},{"internalType":"uint24","name":"fee","type":"uint24"},{"internalType":"address","name":"recipient","type":"address"},{"internalType":"uint256","name":"deadline","type":"uint256"},{"internalType":"uint256","name":"amountOut","type":"uint256"},{"internalType":"uint256","name":"amountInMaximum","type":"uint256"},{"internalType":"uint160","name":"sqrtPriceLimitX96","type":"uint160"}],"internalType":"struct ISwapRouter.ExactOutputSingleParams","name":"params","type":"tuple"}],"name":"exactOutputSingle","outputs":[{"internalType":"uint256","name":"amountIn","type":"uint256"}],"stateMutability":"payable","type":"function"},
+            {"inputs":[{"internalType":"address","name":"recipient","type":"address"},{"internalType":"uint256","name":"amount0","type":"uint256"},{"internalType":"uint256","name":"amount1","type":"uint256"},{"internalType":"bytes","name":"data","type":"bytes"}],"name":"mint","outputs":[{"internalType":"uint256","name":"amount0","type":"uint256"},{"internalType":"uint256","name":"amount1","type":"uint256"}],"stateMutability":"nonpayable","type":"function"},
+            {"inputs":[{"internalType":"uint256","name":"amount0Desired","type":"uint256"},{"internalType":"uint256","name":"amount1Desired","type":"uint256"},{"internalType":"uint256","name":"amount0Min","type":"uint256"},{"internalType":"uint256","name":"amount1Min","type":"uint256"},{"internalType":"address","name":"recipient","type":"address"},{"internalType":"uint256","name":"deadline","type":"uint256"}],"name":"burn","outputs":[{"internalType":"uint256","name":"amount0","type":"uint256"},{"internalType":"uint256","name":"amount1","type":"uint256"}],"stateMutability":"nonpayable","type":"function"}
         ]''')
         
         # Convert pool address to checksum address
@@ -111,10 +148,15 @@ class PoolMonitor:
         
         # Initialize the contract attribute for swap operations
         self.contract = self.pool_contract
+        self.weth_contract = self.web3.eth.contract(address=TOKEN_ADDRESS_MAP["WETH"], abi=self.erc20_abi)
+        self.usdc_contract = self.web3.eth.contract(address=TOKEN_ADDRESS_MAP["USDC"], abi=self.erc20_abi)
         
         # Get token addresses
         self.token0_address = self.pool_contract.functions.token0().call()
         self.token1_address = self.pool_contract.functions.token1().call()
+
+        assert self.token0_address == self.usdc_contract.address
+        assert self.token1_address == self.weth_contract.address
         
         # Get fee tier
         try:
@@ -155,16 +197,8 @@ class PoolMonitor:
         
         This method loads token symbols and decimals for both tokens in the pool.
         """
-        # ERC20 ABI for getting token information
-        erc20_abi = json.loads('''[
-            {"constant":true,"inputs":[],"name":"symbol","outputs":[{"name":"","type":"string"}],"payable":false,"stateMutability":"view","type":"function"},
-            {"constant":true,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"payable":false,"stateMutability":"view","type":"function"}
-        ]''')
-        
-        # Initialize token contracts
-        self.erc20_abi = erc20_abi
-        token0_contract = self.web3.eth.contract(address=self.token0_address, abi=erc20_abi)
-        token1_contract = self.web3.eth.contract(address=self.token1_address, abi=erc20_abi)
+        token0_contract = self.web3.eth.contract(address=self.token0_address, abi=self.erc20_abi)
+        token1_contract = self.web3.eth.contract(address=self.token1_address, abi=self.erc20_abi)
         
         # Get token symbols
         try:
@@ -1205,8 +1239,29 @@ class PoolMonitor:
     
     def wrap_eth(self, amount: float = None):
         if amount is None:
-            amount = self.get_eth_balance(self.wallet_address)
-        return self.web3.toWei(amount, 'ether')
+            amount = self.get_eth_balance(self.wallet_address) * 0.8
+
+        # Convert amount to wei
+        amount_wei = self.web3.toWei(amount, 'ether')
+
+        # wrap eth
+        tx = self.weth_contract.functions.deposit().build_transaction({
+            'chainId': self.web3.eth.chain_id,
+            'gas': 2000000,
+            "maxPriorityFeePerGas": self.web3.eth.max_priority_fee,
+            "maxFeePerGas": 100 * 10**9,
+            'nonce': self.web3.eth.get_transaction_count(self.wallet_address),
+            'value': amount_wei,  # wrap amount in wei
+        })
+
+        signed_transaction = self.web3.eth.account.sign_transaction(tx, self.wallet_private_key)
+        tx_hash = self.web3.eth.send_raw_transaction(signed_transaction.rawTransaction)
+
+        tx_receipt = self.web3.eth.wait_for_transaction_receipt(tx_hash)
+        print(f"tx hash: {self.web3.to_hex(tx_hash)}, gas used: {tx_receipt['gasUsed']}")
+
+        weth_balance = self.weth_contract.functions.balanceOf(self.wallet_address).call()
+        print(f"weth balance: {weth_balance / 10**18}")
     
     def unwrap_eth(self, amount: float = None):
         if amount is None:
@@ -1319,7 +1374,7 @@ class PoolMonitor:
                 'to': self.contract.address,
                 'data': swap_data,
                 'nonce': nonce,
-                'chainId': await self.web3.eth.chain_id
+                'chainId': self.web3.eth.chain_id
             }
             
             # Estimate gas and get gas price
@@ -1387,6 +1442,106 @@ class PoolMonitor:
             logger.error(f"Stack Trace: {traceback.format_exc()}")
             logger.error(f"Error getting TOB size: {e}")
             return 0
+
+    async def execute_trade(self, trade_direction, trade_size, arb_instrument):
+        """
+        Execute a trade on Uniswap.
+
+        Args:
+            trade_direction (str): Direction of the trade ('buy' or 'sell')
+            trade_size (float): Size of the trade
+            arb_instrument (str): Trading instrument (e.g., 'ETHUSDT')
+
+        Returns:
+            dict: Trade details
+        """
+        # Implement trade execution logic here
+        # This is a placeholder implementation
+        return {"status": "success", "trade_size": trade_size}
+
+    async def confirm_trade(self, trade):
+        """
+        Confirm that a trade was executed successfully.
+
+        Args:
+            trade (dict): Trade details
+
+        Returns:
+            float: Confirmed trade size
+        """
+        # Implement trade confirmation logic here
+        # This is a placeholder implementation
+        return trade["trade_size"]
+
+    async def initiate_transfer(self, transfer_direction, transfer_amount, from_address, to_address):
+        """
+        Initiate a transfer of assets.
+
+        Args:
+            transfer_direction (str): Direction of the transfer ('withdraw' or 'deposit')
+            transfer_amount (float): Amount to transfer
+            from_address (str): Source address
+            to_address (str): Destination address
+
+        Returns:
+            dict: Transfer details
+        """
+        # Implement transfer initiation logic here
+        # This is a placeholder implementation
+        return {"status": "initiated", "transfer_amount": transfer_amount}
+
+    async def confirm_transfer(self, transfer):
+        """
+        Confirm that a transfer was completed successfully.
+
+        Args:
+            transfer (dict): Transfer details
+
+        Returns:
+            float: Confirmed transfer size
+        """
+        # Implement transfer confirmation logic here
+        # This is a placeholder implementation
+        return transfer["transfer_amount"]
+
+    async def get_withdraw_address(self, arb_instrument):
+        """
+        Get the address to withdraw assets from.
+
+        Args:
+            arb_instrument (str): Trading instrument
+
+        Returns:
+            str: Withdraw address
+        """
+        # Implement logic to get withdraw address
+        return self.wallet_address
+
+    async def get_deposit_address(self, arb_instrument):
+        """
+        Get the address to deposit assets to.
+
+        Args:
+            arb_instrument (str): Trading instrument
+
+        Returns:
+            str: Deposit address
+        """
+        # Implement logic to get deposit address
+        return self.wallet_address
+
+    async def get_balance(self, arb_instrument):
+        """
+        Get the current balance of a specific asset.
+
+        Args:
+            arb_instrument (str): Trading instrument
+
+        Returns:
+            float: Balance of the asset
+        """
+        # Implement logic to get balance
+        return self.get_token_balance(self.wallet_address, self.get_token_address(arb_instrument))
 
 
 async def test_price_updates(pool_monitor, update_interval=5, track_balances=False):

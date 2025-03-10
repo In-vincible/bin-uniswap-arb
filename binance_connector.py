@@ -218,6 +218,106 @@ class Binance:
         asset_status = await self.get_asset_status(asset)
         return asset_status and asset_status.get('depositStatus', False)
 
+    async def execute_trade(self, trade_direction, trade_size, arb_instrument):
+        """
+        Execute a trade on Binance.
+
+        Args:
+            trade_direction (str): Direction of the trade ('buy' or 'sell')
+            trade_size (float): Size of the trade
+            arb_instrument (str): Trading instrument (e.g., 'ETHUSDT')
+
+        Returns:
+            dict: Trade details
+        """
+        # Implement trade execution logic here
+        # This is a placeholder implementation
+        return {"status": "success", "trade_size": trade_size}
+
+    async def confirm_trade(self, trade):
+        """
+        Confirm that a trade was executed successfully.
+
+        Args:
+            trade (dict): Trade details
+
+        Returns:
+            float: Confirmed trade size
+        """
+        # Implement trade confirmation logic here
+        # This is a placeholder implementation
+        return trade["trade_size"]
+
+    async def initiate_transfer(self, transfer_direction, transfer_amount, from_address, to_address):
+        """
+        Initiate a transfer of assets.
+
+        Args:
+            transfer_direction (str): Direction of the transfer ('withdraw' or 'deposit')
+            transfer_amount (float): Amount to transfer
+            from_address (str): Source address
+            to_address (str): Destination address
+
+        Returns:
+            dict: Transfer details
+        """
+        # Implement transfer initiation logic here
+        # This is a placeholder implementation
+        return {"status": "initiated", "transfer_amount": transfer_amount}
+
+    async def confirm_transfer(self, transfer):
+        """
+        Confirm that a transfer was completed successfully.
+
+        Args:
+            transfer (dict): Transfer details
+
+        Returns:
+            float: Confirmed transfer size
+        """
+        # Implement transfer confirmation logic here
+        # This is a placeholder implementation
+        return transfer["transfer_amount"]
+
+    async def get_withdraw_address(self, arb_instrument):
+        """
+        Get the address to withdraw assets from.
+
+        Args:
+            arb_instrument (str): Trading instrument
+
+        Returns:
+            str: Withdraw address
+        """
+        # Implement logic to get withdraw address
+        return await self.get_deposit_address(arb_instrument)
+
+    async def get_deposit_address(self, arb_instrument):
+        """
+        Get the address to deposit assets to.
+
+        Args:
+            arb_instrument (str): Trading instrument
+
+        Returns:
+            str: Deposit address
+        """
+        # Implement logic to get deposit address
+        return await self.client.get_deposit_address(coin=arb_instrument)
+
+    async def get_balance(self, arb_instrument):
+        """
+        Get the current balance of a specific asset.
+
+        Args:
+            arb_instrument (str): Trading instrument
+
+        Returns:
+            float: Balance of the asset
+        """
+        # Implement logic to get balance
+        balances = await self.get_balances([arb_instrument])
+        return float(balances[arb_instrument]["free"])
 
 # --- Async test code in __main__ ---
 async def main():
