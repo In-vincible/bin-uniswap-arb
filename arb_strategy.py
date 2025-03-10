@@ -21,14 +21,15 @@ class ArbitrageStrategy:
         """
         config = Config()
         instrument_config = config.instrument_config[0]
-        self.instrument = instrument_config['instrument']
+        self.binance_instrument = instrument_config['binance_instrument']
+        self.uniswap_instrument = instrument_config['uniswap_instrument']
         self.base_token = instrument_config['base_token']
         self.quote_token = instrument_config['quote_token']
         self.base_token_address = instrument_config['base_token_address']
         self.quote_token_address = instrument_config['quote_token_address']
         self.arb_config = config.arb_config
-        self.binance = Binance(config.binance_api_key, config.binance_api_secret, [instrument_config['instrument']])
-        self.uniswap = PoolMonitor(instrument_config['pool_address'], config.infura_ws_url, config.wallet_private_key)
+        self.binance = Binance(config.binance_api_key, config.binance_api_secret, [instrument_config['binance_instrument']])
+        self.uniswap = PoolMonitor(instrument_config['uniswap_instrument'], config.infura_ws_url, config.wallet_private_key)
         self.token_monitor = TokenMonitor([instrument_config['base_token_address'], instrument_config['quote_token_address']], config.infura_url)
         self.blocknative_simulator = BlocknativeSimulator(config.blocknative_api_key)
     
@@ -47,7 +48,7 @@ class ArbitrageStrategy:
     
     async def compute_arb_size(self, uniswap_price: float, binance_price: float, uniswap_trade_direction: str):
         binance_trade_direction = 'buy' if uniswap_trade_direction == 'sell' else 'sell'
-        binance_tob_size = await self.binance.get_tob_size(self.instrument, binance_trade_direction)
+        binance_tob_size = await self.binance.get_tob_size(self.binance_instrument, binance_trade_direction)
         uniswap_tob_size = await self.uniswap.get_tob_size(uniswap_trade_direction)
         logger.info(f"Binance TOB size: {binance_tob_size}, Uniswap TOB size: {uniswap_tob_size}")
         exchange_size = min(binance_tob_size, uniswap_tob_size)
@@ -223,11 +224,10 @@ class ArbitrageStrategy:
         Monitor prices on Binance and Uniswap and detect arbitrage opportunities.
         """
         await self.binance.init()
-        await self.uniswap.start_background_updates()
         await self.token_monitor.start_monitoring()
 
         while True:
-            binance_price = self.binance.get_current_base_price(self.instrument)
+            binance_price = self.binance.get_current_base_price(self.binance_instrument)
             uniswap_price = self.uniswap.get_current_base_price()
             logger.info(f"Binance price: {binance_price}, Uniswap price: {uniswap_price}")
             if binance_price and uniswap_price:

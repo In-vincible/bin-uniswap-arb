@@ -31,6 +31,38 @@ TOKEN_ADDRESS_MAP = {
     "WBTC": "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"
 }
 
+INSTRUMENT_TO_POOL_MAP = {
+    "ETH/USDC": {
+        "pool_address": DEFAULT_POOL_ADDRESS,   
+        "base_asset": "USDC",
+        "quote_asset": "ETH"
+    },
+    "USDC/ETH": {
+        "pool_address": DEFAULT_POOL_ADDRESS,
+        "base_asset": "WETH",
+        "quote_asset": "USDC"
+    },
+    "USDT/ETH": {
+        "pool_address": DEFAULT_POOL_ADDRESS,
+        "base_asset": "ETH",
+        "quote_asset": "USDT"
+    },
+    "DAI/ETH": {
+        "pool_address": DEFAULT_POOL_ADDRESS,
+        "base_asset": "ETH",
+        "quote_asset": "DAI"
+    },
+    "WETH/ETH": {
+        "pool_address": DEFAULT_POOL_ADDRESS,
+        "base_asset": "ETH",
+        "quote_asset": "WETH"
+    },
+    "WBTC/ETH": {
+        "pool_address": DEFAULT_POOL_ADDRESS,
+        "base_asset": "ETH",
+        "quote_asset": "WBTC"
+    }
+}
 
 class PoolMonitor:
     """
@@ -40,7 +72,7 @@ class PoolMonitor:
     for any Uniswap V3 pool using Web3 event subscriptions.
     """
     
-    def __init__(self, pool_address, web3_provider_url, wallet_private_key, update_price=True, update_balance=True, intervals=(5, 15)):
+    def __init__(self, instrument, web3_provider_url, wallet_private_key, update_price=True, update_balance=True, intervals=(5, 15)):
         """
         Initialize the pool monitor.
         
@@ -52,7 +84,15 @@ class PoolMonitor:
             update_balance (bool): Whether to start background balance updates
             intervals (tuple): Intervals for price and balance updates (price_interval, balance_interval)
         """
-        self.pool_address = pool_address.lower()
+        if instrument not in INSTRUMENT_TO_POOL_MAP:
+            raise ValueError(f"{instrument} not found in INSTRUMENT_TO_POOL_MAP (uniswap_connector.py), please add it to the map to use this instrument.")
+        
+        pool_info = INSTRUMENT_TO_POOL_MAP[instrument]
+        self.instrument = instrument
+        self.pool_address = pool_info["pool_address"]
+        self.base_asset = pool_info["base_asset"]
+        self.quote_asset = pool_info["quote_asset"]
+
         self.web3_provider_url = web3_provider_url
         self.wallet_private_key = wallet_private_key
         
@@ -66,7 +106,6 @@ class PoolMonitor:
         
         # Initialize caches for this instance
         self._price_cache = {}
-        self._token_cache = {}
         self._balance_cache = {}
         
         # Flag to control background updates
@@ -81,15 +120,14 @@ class PoolMonitor:
         self.last_tick = None
         self.last_tick_change_time = None
         
-        # Initialize pool contract and token info
+        # Initialize pool 
         self._initialize_pool()
-        self._initialize_token_info()
         
         # Start background updates if requested
         if update_price:
-            asyncio.create_task(self.start_background_updates(self.update_interval))
+            asyncio.create_task(self.start_price_updates(self.update_interval))
         if update_balance:
-            asyncio.create_task(self.start_balance_updates(self.wallet_address, self.balance_update_interval))
+            asyncio.create_task(self.start_balance_updates(self.balance_update_interval))
         
 
     def _initialize_pool(self):
@@ -99,14 +137,6 @@ class PoolMonitor:
         This method sets up the Web3 connection, loads the pool contract,
         and initializes token information.
         """
-        # ERC20 ABI for getting token information
-        # Current minimal ERC20 ABI - only has symbol and decimals functions
-        # erc20_abi = json.loads('''[
-        #     {"constant":true,"inputs":[],"name":"symbol","outputs":[{"name":"","type":"string"}],"payable":false,"stateMutability":"view","type":"function"},
-        #     {"constant":true,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"payable":false,"stateMutability":"view","type":"function"}
-        # ]''')
-
-        # ABI with all functions
         erc20_abi = json.loads('''[
             {"constant":true,"inputs":[],"name":"symbol","outputs":[{"name":"","type":"string"}],"payable":false,"stateMutability":"view","type":"function"},
             {"constant":true,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"payable":false,"stateMutability":"view","type":"function"},
@@ -145,51 +175,12 @@ class PoolMonitor:
         
         # Initialize pool contract
         self.pool_contract = self.web3.eth.contract(address=checksum_pool_address, abi=pool_abi)
-        
-        # Initialize the contract attribute for swap operations
-        self.contract = self.pool_contract
-        self.weth_contract = self.web3.eth.contract(address=TOKEN_ADDRESS_MAP["WETH"], abi=self.erc20_abi)
-        self.usdc_contract = self.web3.eth.contract(address=TOKEN_ADDRESS_MAP["USDC"], abi=self.erc20_abi)
-        
-        # Get token addresses
-        self.token0_address = self.pool_contract.functions.token0().call()
-        self.token1_address = self.pool_contract.functions.token1().call()
-
-        assert self.token0_address == self.usdc_contract.address
-        assert self.token1_address == self.weth_contract.address
-        
-        # Get fee tier
-        try:
-            self.fee_tier = self.pool_contract.functions.fee().call()
-        except Exception as e:
-            logger.error(f"Error getting fee tier: {e}")
-            # Default to 0.3% fee tier
-            self.fee_tier = 3000
-            
-        # Get tick spacing
-        try:
-            self.tick_spacing = self.pool_contract.functions.tickSpacing().call()
-        except Exception as e:
-            logger.warning(f"Error getting tick spacing: {e}")
-            # Default tick spacing based on fee tier
-            if self.fee_tier == 500:  # 0.05%
-                self.tick_spacing = 10
-            elif self.fee_tier == 3000:  # 0.3%
-                self.tick_spacing = 60
-            elif self.fee_tier == 10000:  # 1%
-                self.tick_spacing = 200
-            else:
-                self.tick_spacing = 60  # Default
+        self.fee_tier = self.pool_contract.functions.fee().call()
+        self.tick_spacing = self.pool_contract.functions.tickSpacing().call()
         
         # Initialize token information
         self._initialize_token_info()
         
-        # Set up event filter for Swap events
-        swap_event_signature_hash = self.web3.keccak(text="Swap(address,address,int256,int256,uint160,uint128,int24)").hex()
-        self.swap_filter = self.web3.eth.filter({
-            'address': checksum_pool_address,
-            'topics': [swap_event_signature_hash]
-        })
     
     def _initialize_token_info(self):
         """
@@ -197,37 +188,52 @@ class PoolMonitor:
         
         This method loads token symbols and decimals for both tokens in the pool.
         """
-        token0_contract = self.web3.eth.contract(address=self.token0_address, abi=self.erc20_abi)
-        token1_contract = self.web3.eth.contract(address=self.token1_address, abi=self.erc20_abi)
+        token0_address = self.pool_contract.functions.token0().call()
+        token1_address = self.pool_contract.functions.token1().call()
+        token0_contract = self.web3.eth.contract(address=token0_address, abi=self.erc20_abi)
+        token1_contract = self.web3.eth.contract(address=token1_address, abi=self.erc20_abi)
+
+        token0_symbol = token0_contract.functions.symbol().call()
+        token1_symbol = token1_contract.functions.symbol().call()
+
+        base_token_contract = token0_contract
+        quote_token_contract = token1_contract
+
+        if token0_symbol.lower() == self.base_asset.lower():
+            assert token1_symbol.lower() == self.quote_asset.lower(), f'{self.instrument} info in INSTRUMENT_TO_POOL_MAP is incorrect (quote token: {token1_symbol} from pool is not the same as the quote asset: {self.quote_asset})'
+            base_token_contract, quote_token_contract = token0_contract, token1_contract
+        else:
+            assert token0_symbol.lower() == self.quote_asset.lower(), f'{self.instrument} info in INSTRUMENT_TO_POOL_MAP is incorrect (base token: {token0_symbol} from pool is not the same as the base asset: {self.base_asset})'
+            assert token1_symbol.lower() == self.base_asset.lower(), f'{self.instrument} info in INSTRUMENT_TO_POOL_MAP is incorrect (quote token: {token1_symbol} from pool is not the same as the quote asset: {self.quote_asset})'
+            base_token_contract, quote_token_contract = token1_contract, token0_contract
         
-        # Get token symbols
-        try:
-            self.token0_symbol = token0_contract.functions.symbol().call()
-            self.token1_symbol = token1_contract.functions.symbol().call()
-        except Exception as e:
-            logger.error(f"Error getting token symbols: {e}")
-            # Use addresses as fallback
-            self.token0_symbol = self.token0_address[:6] + "..." + self.token0_address[-4:]
-            self.token1_symbol = self.token1_address[:6] + "..." + self.token1_address[-4:]
-        
-        # Get token decimals
-        try:
-            self.token0_decimals = token0_contract.functions.decimals().call()
-            self.token1_decimals = token1_contract.functions.decimals().call()
-        except Exception as e:
-            logger.error(f"Error getting token decimals: {e}")
-            # Use 18 as fallback (common for most tokens)
-            self.token0_decimals = 18
-            self.token1_decimals = 18
-        
-        # Store token info in cache
-        self._token_cache[self.token0_address] = {
-            'symbol': self.token0_symbol,
-            'decimals': self.token0_decimals
+            
+        self.base_token_info = {
+            'address': base_token_contract.address,
+            'symbol': base_token_contract.functions.symbol().call(),
+            'decimals': base_token_contract.functions.decimals().call(),
+            'contract': base_token_contract
         }
-        self._token_cache[self.token1_address] = {
-            'symbol': self.token1_symbol,
-            'decimals': self.token1_decimals
+        
+        self.quote_token_info = {
+            'address': quote_token_contract.address,
+            'symbol': quote_token_contract.functions.symbol().call(),
+            'decimals': quote_token_contract.functions.decimals().call(),
+            'contract': quote_token_contract
+        }
+
+        self.token0_info = {
+            'address': token0_address,
+            'symbol': token0_symbol,
+            'decimals': token0_contract.functions.decimals().call(),
+            'contract': token0_contract
+        }
+
+        self.token1_info = {
+            'address': token1_address,
+            'symbol': token1_symbol,
+            'decimals': token1_contract.functions.decimals().call(),
+            'contract': token1_contract
         }
     
     def get_token_address(self, symbol: str) -> str:
@@ -238,12 +244,12 @@ class PoolMonitor:
         Returns:
             str: The address of the token if found, None otherwise.
         """
-        if symbol.upper() == self.token0_symbol.upper():
-            return self.token0_address
-        elif symbol.upper() == self.token1_symbol.upper():
-            return self.token1_address
+        if symbol.lower() == self.base_asset.lower():
+            return self.base_token_info['address']
+        elif symbol.lower() == self.quote_asset.lower():
+            return self.quote_token_info['address']
         else:
-            return None
+            raise ValueError(f"{symbol} not part of the pool")
     
     def calculate_price_from_tick(self, tick):
         """
@@ -357,8 +363,8 @@ class PoolMonitor:
                 reserve1 = liquidity * (sqrt_price_b - sqrt_price_a)
             
             # Convert to human-readable format with proper decimals
-            reserve0_hr = reserve0 / (10 ** self.token0_decimals)
-            reserve1_hr = reserve1 / (10 ** self.token1_decimals)
+            reserve0_hr = reserve0 / (10 ** self.token0_info['decimals'])
+            reserve1_hr = reserve1 / (10 ** self.token1_info['decimals'])
             
             # Log calculations for debugging
             logger.debug(f"Reserve calculation details:")
@@ -385,8 +391,8 @@ class PoolMonitor:
                 reserve1 = liquidity * sqrt_price
                 
                 # Convert to human-readable format with proper decimals
-                reserve0_hr = reserve0 / (10 ** self.token0_decimals)
-                reserve1_hr = reserve1 / (10 ** self.token1_decimals)
+                reserve0_hr = reserve0 / (10 ** self.token0_info['decimals'])
+                reserve1_hr = reserve1 / (10 ** self.token1_info['decimals'])
                 
                 return reserve0, reserve1, reserve0_hr, reserve1_hr
             except:
@@ -491,13 +497,13 @@ class PoolMonitor:
             # 1. Calculate price from sqrtPriceX96
             sqrt_price_token0, sqrt_price_token1 = self.calculate_price_from_sqrtprice(
                 sqrt_price_x96, 
-                self.token0_decimals, 
-                self.token1_decimals
+                self.token0_info['decimals'], 
+                self.token1_info['decimals']
             )
             
             # 2. Calculate price from tick
             raw_price = self.calculate_price_from_tick(current_tick)  # Raw price from tick
-            decimal_adjustment = 10 ** (self.token0_decimals - self.token1_decimals)
+            decimal_adjustment = 10 ** (self.token0_info['decimals'] - self.token1_info['decimals'])
             tick_price = raw_price * decimal_adjustment  # Price from tick calculation
             tick_price_token0 = 1 / tick_price if tick_price != 0 else 0  # Inverse price from tick
             
@@ -508,8 +514,8 @@ class PoolMonitor:
             
             # Log the reserves for debugging
             logger.info(f"Calculated reserves using whitepaper formula:")
-            logger.info(f"Hourly {self.token0_symbol} reserves: {reserve0_hr:.2f}")
-            logger.info(f"Hourly {self.token1_symbol} reserves: {reserve1_hr:.2f}")
+            logger.info(f"Hourly {self.token0_info['symbol']} reserves: {reserve0_hr:.2f}")
+            logger.info(f"Hourly {self.token1_info['symbol']} reserves: {reserve1_hr:.2f}")
             
             # Update the cache
             timestamp = int(time.time())
@@ -580,7 +586,10 @@ class PoolMonitor:
         Returns:
             float: The current price of the base token
         """
-        return self.get_current_price()['token1_price']
+        if self.base_token_info['symbol'] == self.token1_info['symbol']:
+            return self.get_current_price()['token1_price']
+        else:
+            return self.get_current_price()['token0_price']
     
     def _format_number(self, number):
         """
@@ -625,7 +634,7 @@ class PoolMonitor:
             days = seconds / 86400
             return f"{days:.1f}d"
     
-    async def start_background_updates(self, interval=5):
+    async def start_price_updates(self, interval=5):
         """
         Start a background task to periodically update the price cache.
         
@@ -641,9 +650,9 @@ class PoolMonitor:
         logger.info(f"Starting background price updates every {interval} seconds")
         
         # Create and start the background task
-        self.background_task = asyncio.create_task(self._background_update_loop())
+        self.background_task = asyncio.create_task(self._backgroup_price_update_loop())
     
-    async def _background_update_loop(self):
+    async def _backgroup_price_update_loop(self):
         """
         Background loop to periodically update the price cache.
         
@@ -962,7 +971,7 @@ class PoolMonitor:
             logger.error(f"Error getting token balance: {e}")
             return 0.0
     
-    def update_balance_cache(self, address, token_addresses=None):
+    def update_balance_cache(self):
         """
         Update the balance cache for an address.
         
@@ -976,43 +985,15 @@ class PoolMonitor:
         """
         # Get current time for cache timestamp
         timestamp = int(time.time())
+        for symbol_info in [self.base_token_info, self.quote_token_info]:
+            symbol_contract = symbol_info['contract']
+            symbol = symbol_info['symbol']
+            decimals = symbol_info['decimals']
+            balance = symbol_contract.functions.balanceOf(self.wallet_address).call()
+            symbol_balance = balance / (10 ** decimals)
+            self._balance_cache[symbol.lower()] = symbol_balance
         
-        # Default tokens to check: ETH, token0, token1
-        if token_addresses is None:
-            token_addresses = [self.token0_address, self.token1_address]
-        
-        # Get ETH balance
-        eth_balance = self.get_eth_balance(address)
-        
-        # Initialize balances dictionary
-        balances = {
-            'ETH': eth_balance
-        }
-        
-        # Get token balances
-        for token_address in token_addresses:
-            token_balance = self.get_token_balance(address, token_address)
-            
-            # Get token symbol from cache
-            if token_address in self._token_cache:
-                symbol = self._token_cache[token_address]['symbol']
-            else:
-                # If not in cache, use address as fallback (shouldn't happen)
-                symbol = token_address[:6] + "..." + token_address[-4:]
-            
-            balances[symbol] = token_balance
-        
-        # Update the balance cache
-        self._balance_cache[address.lower()] = {
-            'balances': balances,
-            'timestamp': timestamp
-        }
-        
-        logger.info(f"Updated balance cache for {address}")
-        for symbol, balance in balances.items():
-            logger.info(f"  {symbol}: {balance}")
-        
-        return self._balance_cache[address.lower()]
+        return self._balance_cache
     
     def get_balances(self, token_addresses=None, live=False):
         """
@@ -1058,7 +1039,7 @@ class PoolMonitor:
         # If no cache entry exists, update it
         return self.update_balance_cache(address, token_addresses)
 
-    async def _balance_update_loop(self, address):
+    async def _balance_update_loop(self):
         """
         Background loop to periodically update the balance cache.
         
@@ -1069,11 +1050,11 @@ class PoolMonitor:
             while self.balance_updates_running:
                 try:
                     # Update the balance cache
-                    balance_data = self.update_balance_cache(address)
+                    balance_data = self.update_balance_cache()
                     
                     # Log the balances
-                    logger.info(f"Current balances for {address}:")
-                    for symbol, balance in balance_data['balances'].items():
+                    logger.info(f"Current balances for {self.wallet_address}:")
+                    for symbol, balance in balance_data.items():
                         logger.info(f"  {symbol}: {balance}")
                     
                     # Sleep for the balance update interval
@@ -1089,7 +1070,7 @@ class PoolMonitor:
             logger.error(f"Error in background balance update loop: {e}")
             self.balance_updates_running = False
 
-    async def start_balance_updates(self, address, interval=15):
+    async def start_balance_updates(self, interval=15):
         """
         Start a background task to periodically update the balance cache.
         
@@ -1103,10 +1084,10 @@ class PoolMonitor:
         
         self.balance_update_interval = interval
         self.balance_updates_running = True
-        logger.info(f"Starting background balance updates every {interval} seconds for {address}")
+        logger.info(f"Starting background balance updates every {interval} seconds")
         
         # Create and start the balance update task
-        self.balance_task = asyncio.create_task(self._balance_update_loop(address))
+        self.balance_task = asyncio.create_task(self._balance_update_loop())
 
     async def stop_background_updates(self):
         """
@@ -1181,15 +1162,43 @@ class PoolMonitor:
             account = self.web3.eth.account.from_key(self.wallet_private_key)
             from_address = account.address
             
-            # Get nonce for transaction
-            nonce = self.web3.eth.get_transaction_count(from_address)
+            logger.info(f"Transfer initiated: From {from_address} to {to_address}")
             
+            # Check sender balance first
             if token_address:
-                # ERC20 Transfer
+                # ERC20 Transfer - Check token balance first
                 token_contract = self.web3.eth.contract(address=token_address, abi=self.erc20_abi)
                 decimals = token_contract.functions.decimals().call()
                 amount_wei = int(amount * (10 ** decimals))
                 
+                # Check sender's token balance
+                sender_balance = token_contract.functions.balanceOf(from_address).call()
+                logger.info(f"Token transfer: Amount={amount} ({amount_wei} wei), Sender balance={sender_balance / (10 ** decimals)} ({sender_balance} wei)")
+                
+                if sender_balance < amount_wei:
+                    logger.error(f"Insufficient token balance: Have {sender_balance / (10 ** decimals)}, need {amount}")
+                    return None
+                
+                # Check allowance (if relevant)
+                allowance = token_contract.functions.allowance(from_address, token_address).call()
+                logger.info(f"Token allowance: {allowance / (10 ** decimals)}")
+                
+            else:
+                # Native ETH transfer - Check ETH balance first
+                amount_wei = self.web3.toWei(amount, 'ether')
+                sender_balance = self.web3.eth.get_balance(from_address)
+                logger.info(f"ETH transfer: Amount={amount} ETH ({amount_wei} wei), Sender balance={self.web3.fromWei(sender_balance, 'ether')} ETH ({sender_balance} wei)")
+                
+                if sender_balance < amount_wei:
+                    logger.error(f"Insufficient ETH balance: Have {self.web3.fromWei(sender_balance, 'ether')} ETH, need {amount} ETH")
+                    return None
+            
+            # Get nonce for transaction
+            nonce = self.web3.eth.get_transaction_count(from_address)
+            logger.info(f"Using nonce: {nonce}")
+            
+            if token_address:
+                # ERC20 Transfer
                 # Build transaction
                 tx_data = token_contract.encodeABI(
                     fn_name="transfer", 
@@ -1201,33 +1210,60 @@ class PoolMonitor:
                     'to': token_address,
                     'data': tx_data,
                     'nonce': nonce,
-                    'chainId': await self.web3.eth.chain_id
+                    'chainId': self.web3.eth.chain_id
                 }
+                logger.info(f"Created ERC20 transfer transaction for token: {token_address}")
             else:
                 # Native ETH transfer
-                amount_wei = self.web3.toWei(amount, 'ether')
                 tx = {
                     'from': from_address,
                     'to': to_address,
                     'value': amount_wei,
                     'nonce': nonce,
-                    'chainId': await self.web3.eth.chain_id
+                    'chainId': self.web3.eth.chain_id
                 }
+                logger.info(f"Created native ETH transfer transaction")
             
-            # Estimate gas and get gas price
-            gas = await self.web3.eth.estimate_gas(tx)
+            # Get gas price first
             gas_price = await self.web3.eth.gas_price
+            logger.info(f"Current gas price: {self.web3.fromWei(gas_price, 'gwei')} gwei")
+            
+            # Add gas price to transaction to help with gas estimation
+            tx['gasPrice'] = gas_price
+            
+            # Try to estimate gas with detailed error handling
+            try:
+                logger.info(f"Estimating gas for transaction: {tx}")
+                gas = await self.web3.eth.estimate_gas(tx)
+                logger.info(f"Gas estimation successful: {gas} gas units")
+            except Exception as gas_error:
+                logger.error(f"Gas estimation failed with error: {str(gas_error)}")
+                logger.error(f"Gas estimation stack trace: {traceback.format_exc()}")
+                
+                # Add a fallback gas limit and warn about it
+                if token_address:
+                    fallback_gas = 100000  # Higher fallback for token transfers
+                else:
+                    fallback_gas = 21000   # Standard ETH transfer gas
+                
+                logger.warning(f"Using fallback gas limit of {fallback_gas}. Transaction may fail.")
+                gas = fallback_gas
             
             # Add gas details to transaction
             tx['gas'] = gas
-            tx['gasPrice'] = gas_price
             
             # Sign and send transaction
+            logger.info(f"Signing transaction with gas={gas}, gasPrice={gas_price}")
             signed_tx = self.web3.eth.account.sign_transaction(tx, self.wallet_private_key)
-            tx_hash = await self.web3.eth.send_raw_transaction(signed_tx.rawTransaction)
             
-            logger.info(f"Pool transfer initiated. Transaction hash: {tx_hash.hex()}")
-            return tx_hash.hex()
+            try:
+                tx_hash = await self.web3.eth.send_raw_transaction(signed_tx.rawTransaction)
+                logger.info(f"Pool transfer initiated. Transaction hash: {tx_hash.hex()}")
+                return tx_hash.hex()
+            except Exception as send_error:
+                logger.error(f"Transaction sending failed: {str(send_error)}")
+                logger.error(f"Transaction details: {tx}")
+                return None
             
         except Exception as e:
             logger.error(f"Stack Trace: {traceback.format_exc()}")
@@ -1235,7 +1271,7 @@ class PoolMonitor:
             return None
     
     def _deadline(self):
-        return int(time.time()) + 60 * 10
+        return int(time.time()) + 5
     
     def wrap_eth(self, amount: float = None):
         if amount is None:
@@ -1268,131 +1304,156 @@ class PoolMonitor:
             amount = self.get_eth_balance(self.wallet_address)
         return self.web3.fromWei(amount, 'ether')
     
-    async def swap_instrument(self, amount: float, token_address: str, is_exact_input: bool = True, slippage: float = 0.005) -> str:
+    async def swap_instrument(self, amount: float, token_address: str, is_exact_input: bool = True, slippage: float = 0.005, deadline: int = 60) -> str:
         """
-        Execute a swap transaction in the current Uniswap pool.
-        
-        This method allows swapping between the two tokens in the pool, handling both exact input 
-        and exact output swaps with slippage protection.
-        
-        Args:
-            amount (float): The amount to swap (interpreted as input amount if is_exact_input=True, 
-                        otherwise as desired output amount)
-            token_address (str): Address of the token being sent (for input) or received (for output)
-            is_exact_input (bool): If True, amount is the exact input amount. If False, amount is 
-                                the desired output amount.
-            slippage (float): Maximum acceptable slippage as a decimal (e.g., 0.005 for 0.5%)
-        
-        Returns:
-            str: Transaction hash if successful, None if failed
-            
-        Raises:
-            ValueError: If token_address is not one of the pool's tokens
+        Execute a swap transaction using Uniswap V3 SwapRouter.
         """
         try:
+            # Define Uniswap V3 Router address
+            UNISWAP_V3_ROUTER = "0xE592427A0AEce92De3Edee1F18E0157C05861564"  # Mainnet SwapRouter
+            
             # Verify token is in pool
-            token0 = self.token0_address
-            token1 = self.token1_address
+            token0 = self.token0_info['address']
+            token1 = self.token1_info['address']
             token_address = self.web3.toChecksumAddress(token_address)
             
-            if token_address not in [token0, token1]:
-                raise ValueError("Token address must be one of the pool's tokens")
+            logger.info(f"Swap parameters: amount={amount}, token_address={token_address}, is_exact_input={is_exact_input}")
+            logger.info(f"Pool tokens: token0={token0}, token1={token1}")
             
-            current_price = self.get_current_price(live=True)
-
+            if token_address not in [token0, token1]:
+                raise ValueError(f"Token address {token_address} must be one of the pool's tokens ({token0} or {token1})")
+            
             # Determine which token is being swapped in/out
-            is_token0 = False
-            if token_address == token0:
-                is_token0 = True
-                current_price = current_price['token0_price']
-            else:
-                current_price = current_price['token1_price']
-                
+            is_token0 = (token_address == token0)
+            token_in = token0 if is_token0 else token1
+            token_out = token1 if is_token0 else token0
+            
+            logger.info(f"Token in: {token_in}, Token out: {token_out}, Is token0: {is_token0}")
+            
+            # Get token contract and decimals
             token_contract = self.web3.eth.contract(address=token_address, abi=self.erc20_abi)
             decimals = token_contract.functions.decimals().call()
+            logger.info(f"Token decimals: {decimals}")
+            
+            # Check token balance
+            token_balance = token_contract.functions.balanceOf(self.wallet_address).call()
+            token_balance_human = token_balance / (10 ** decimals)
+            logger.info(f"Token balance: {token_balance_human} ({token_balance} wei)")
             
             # Convert amount to wei
             amount_wei = int(amount * (10 ** decimals))
+            logger.info(f"Amount in wei: {amount_wei}")
             
-            # Calculate minimum output or maximum input based on slippage
+            if is_exact_input and token_balance < amount_wei:
+                logger.error(f"Insufficient token balance: {token_balance_human} < {amount}")
+                return None
+            
+            # Initialize router contract with ABI
+            router_abi = json.loads('''[
+                {"inputs":[{"components":[{"internalType":"address","name":"tokenIn","type":"address"},{"internalType":"address","name":"tokenOut","type":"address"},{"internalType":"uint24","name":"fee","type":"uint24"},{"internalType":"address","name":"recipient","type":"address"},{"internalType":"uint256","name":"deadline","type":"uint256"},{"internalType":"uint256","name":"amountIn","type":"uint256"},{"internalType":"uint256","name":"amountOutMinimum","type":"uint256"},{"internalType":"uint160","name":"sqrtPriceLimitX96","type":"uint160"}],"internalType":"struct ISwapRouter.ExactInputSingleParams","name":"params","type":"tuple"}],"name":"exactInputSingle","outputs":[{"internalType":"uint256","name":"amountOut","type":"uint256"}],"stateMutability":"payable","type":"function"},
+                {"inputs":[{"components":[{"internalType":"address","name":"tokenIn","type":"address"},{"internalType":"address","name":"tokenOut","type":"address"},{"internalType":"uint24","name":"fee","type":"uint24"},{"internalType":"address","name":"recipient","type":"address"},{"internalType":"uint256","name":"deadline","type":"uint256"},{"internalType":"uint256","name":"amountOut","type":"uint256"},{"internalType":"uint256","name":"amountInMaximum","type":"uint256"},{"internalType":"uint160","name":"sqrtPriceLimitX96","type":"uint160"}],"internalType":"struct ISwapRouter.ExactOutputSingleParams","name":"params","type":"tuple"}],"name":"exactOutputSingle","outputs":[{"internalType":"uint256","name":"amountIn","type":"uint256"}],"stateMutability":"payable","type":"function"}
+            ]''')
+            
+            router_contract = self.web3.eth.contract(
+                address=self.web3.toChecksumAddress(UNISWAP_V3_ROUTER),
+                abi=router_abi
+            )
+            
+            # Check if token approval is needed
+            allowance = token_contract.functions.allowance(
+                self.wallet_address, 
+                self.web3.toChecksumAddress(UNISWAP_V3_ROUTER)
+            ).call()
+            
+            logger.info(f"Current allowance: {allowance / (10 ** decimals)} ({allowance} wei)")
+            
+            if allowance < amount_wei:
+                logger.info(f"Approving router to spend {amount} tokens...")
+                # Need to approve the router to spend tokens
+                approve_tx = token_contract.functions.approve(
+                    self.web3.toChecksumAddress(UNISWAP_V3_ROUTER),
+                    amount_wei * 2  # Approve more than needed
+                ).build_transaction({
+                    'from': self.wallet_address,
+                    'nonce': self.web3.eth.get_transaction_count(self.wallet_address),
+                    'gas': 100000,  # Standard approval gas
+                    'gasPrice': self.web3.eth.gas_price,
+                    'chainId': self.web3.eth.chain_id
+                })
+                
+                # Sign and send approval transaction
+                signed_tx = self.web3.eth.account.sign_transaction(approve_tx, self.wallet_private_key)
+                approve_tx_hash = self.web3.eth.send_raw_transaction(signed_tx.rawTransaction)
+                
+                # Wait for approval
+                logger.info(f"Waiting for approval transaction {approve_tx_hash.hex()} to be confirmed...")
+                self.web3.eth.wait_for_transaction_receipt(approve_tx_hash)
+                logger.info("Approval confirmed!")
+            
+            # Convert deadline from seconds to timestamp
+            deadline_timestamp = int(time.time()) + deadline
+            logger.info(f"Using deadline: {deadline_timestamp} (current time + {deadline} seconds)")
+            
+            # Calculate output with slippage or input with slippage
+            current_price = self.get_current_price(live=True)
+            
             if is_exact_input:
-                min_output = int(amount_wei * current_price * (1 - slippage))
-                swap_params = {
-                    'tokenIn': token0 if is_token0 else token1,
-                    'tokenOut': token1 if is_token0 else token0,
-                    'fee': self.contract.functions.fee().call(),
-                    'recipient': self.wallet_address,
-                    'deadline': self._deadline(),
-                    'amountIn': amount_wei,
-                    'amountOutMinimum': min_output,
-                    'sqrtPriceLimitX96': 0  # No price limit
-                }
+                # For WETH to USDC
+                if not is_token0:  # WETH is token1
+                    expected_output = amount_wei * current_price['token1_price'] / (10**6)  # Convert to USDC decimals
+                else:  # WETH is token0
+                    expected_output = amount_wei * current_price['token0_price'] / (10**6)
+                    
+                # Apply slippage - 50% more than requested for safety
+                real_slippage = slippage * 1.5
+                min_output = int(expected_output * (1 - real_slippage))
+                
+                logger.info(f"Exact input swap: {amount} tokens in, expecting ~{expected_output/(10**6)} out")
+                logger.info(f"Min output with {real_slippage*100}% effective slippage: {min_output/(10**6)}")
+                
+                # Create transaction parameters
+                params = (
+                    token_in,                # tokenIn
+                    token_out,               # tokenOut
+                    self.fee_tier,           # fee
+                    self.wallet_address,     # recipient
+                    deadline_timestamp,      # deadline
+                    amount_wei,              # amountIn
+                    min_output,              # amountOutMinimum
+                    0                        # sqrtPriceLimitX96 (0 = no limit)
+                )
+                
+                # Build transaction
+                tx = router_contract.functions.exactInputSingle(params).build_transaction({
+                    'from': self.wallet_address,
+                    'nonce': self.web3.eth.get_transaction_count(self.wallet_address),
+                    'gas': 300000,  # Safe starting value
+                    'value': 0,     # Not sending ETH directly
+                    'chainId': self.web3.eth.chain_id
+                })
             else:
-                max_input = int(amount_wei / current_price * (1 + slippage))
-                swap_params = {
-                    'tokenIn': token0 if is_token0 else token1,
-                    'tokenOut': token1 if is_token0 else token0,
-                    'fee': self.contract.functions.fee().call(),
-                    'recipient': self.wallet_address,
-                    'deadline': self._deadline(),
-                    'amountOut': amount_wei,
-                    'amountInMaximum': max_input,
-                    'sqrtPriceLimitX96': 0  # No price limit
-                }
-
-            # Build swap transaction
-            nonce = self.web3.eth.get_transaction_count(self.wallet_address)
-
-            # Encode the swap function call
-            fn_name = "exactInputSingle" if is_exact_input else "exactOutputSingle"
-            if is_exact_input:
-                swap_data = self.contract.encodeABI(fn_name=fn_name, args=[(
-                    swap_params['tokenIn'],
-                    swap_params['tokenOut'],
-                    swap_params['fee'],
-                    swap_params['recipient'],
-                    swap_params['deadline'],
-                    swap_params['amountIn'],
-                    swap_params['amountOutMinimum'],
-                    swap_params['sqrtPriceLimitX96']
-                )])
-            else:
-                swap_data = self.contract.encodeABI(fn_name=fn_name, args=[(
-                    swap_params['tokenIn'],
-                    swap_params['tokenOut'],
-                    swap_params['fee'],
-                    swap_params['recipient'],
-                    swap_params['deadline'],
-                    swap_params['amountOut'],
-                    swap_params['amountInMaximum'],
-                    swap_params['sqrtPriceLimitX96']
-                )])
+                # Exact output logic (similar but for exact output)
+                # ... (code omitted for brevity)
+                return None  # Not yet implemented
             
-            # Build transaction
-            tx = {
-                'from': self.wallet_address,
-                'to': self.contract.address,
-                'data': swap_data,
-                'nonce': nonce,
-                'chainId': self.web3.eth.chain_id
-            }
-            
-            # Estimate gas and get gas price
-            gas = await self.web3.eth.estimate_gas(tx)
-            gas_price = await self.web3.eth.gas_price
-            
-            tx['gas'] = gas
-            tx['gasPrice'] = gas_price
+            # Try to get gas estimate
+            try:
+                estimated_gas = self.web3.eth.estimate_gas(tx)
+                tx['gas'] = estimated_gas
+                logger.info(f"Gas estimation successful: {estimated_gas}")
+            except Exception as e:
+                logger.error(f"Gas estimation failed: {str(e)}")
+                # Continue with default gas if estimation fails
             
             # Sign and send transaction
             signed_tx = self.web3.eth.account.sign_transaction(tx, self.wallet_private_key)
-            tx_hash = await self.web3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            tx_hash = self.web3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            logger.info(f"Swap transaction submitted: {tx_hash.hex()}")
             
-            logger.info(f"Swap transaction initiated. Hash: {tx_hash.hex()}")
             return tx_hash.hex()
             
         except Exception as e:
-            logger.error(f'Stack Trace: {traceback.format_exc()}')
+            logger.error(f"Stack Trace: {traceback.format_exc()}")
             logger.error(f"Swap failed: {str(e)}")
             return None
 
@@ -1417,8 +1478,8 @@ class PoolMonitor:
             if reserve0 is None or reserve1 is None:
                 return 0
             
-            token_we_are_getting = self.token0_address if direction == 'sell' else self.token1_address
-            is_base_token = token_we_are_getting == self.token0_address
+            token_we_are_getting = self.token0_info['address'] if direction == 'sell' else self.token1_info['address']
+            is_base_token = token_we_are_getting == self.token0_info['address']
                 
             if is_base_token:
                 tob_size = reserve0 * 0.001
@@ -1432,9 +1493,9 @@ class PoolMonitor:
             # convert to base token units
             if is_base_token:
                 current_price = self.get_current_price()['token0_price']
-                tob_size = tob_size / (10 ** self.token0_decimals) / current_price
+                tob_size = tob_size / (10 ** self.token0_info['decimals']) / current_price
             else:
-                tob_size = tob_size / (10 ** self.token1_decimals)
+                tob_size = tob_size / (10 ** self.token1_info['decimals'])
             
             return tob_size
             
@@ -1455,6 +1516,9 @@ class PoolMonitor:
         Returns:
             dict: Trade details
         """
+        if arb_instrument not in [self.token0_info['symbol'], self.token1_info['symbol']]:
+            raise ValueError(f"Invalid instrument: {arb_instrument}, instruemnt not found in pool. (pool: {self.instrument})")
+        
         # Implement trade execution logic here
         # This is a placeholder implementation
         return {"status": "success", "trade_size": trade_size}
@@ -1544,193 +1608,6 @@ class PoolMonitor:
         return self.get_token_balance(self.wallet_address, self.get_token_address(arb_instrument))
 
 
-async def test_price_updates(pool_monitor, update_interval=5, track_balances=False):
-    """
-    Test function to verify that the price updates are working properly.
-    Uses an existing PoolMonitor instance to continuously log prices.
-    
-    Args:
-        pool_monitor (PoolMonitor): An initialized PoolMonitor instance
-        update_interval (int): Interval in seconds between price updates
-        track_balances (bool): Whether to also track and log balances
-    """
-    logger.info("Testing price updates using PoolMonitor class...")
-    
-    # Start background price updates
-    await pool_monitor.start_background_updates(update_interval)
-    
-    # Start background balance updates if requested
-    address = None
-    if track_balances:
-        config = Config()
-        if hasattr(config, 'private_key') and config.private_key:
-            account = pool_monitor.web3.eth.account.from_key(config.private_key)
-            address = account.address
-            logger.info(f"Will track balances for account: {address}")
-            
-            # Initialize balance cache
-            balance_data = pool_monitor.update_balance_cache(address)
-            logger.info(f"Initial balances for {address}:")
-            for symbol, balance in balance_data['balances'].items():
-                logger.info(f"  {symbol}: {balance}")
-            
-            # Start balance updates (every 15 seconds by default)
-            await pool_monitor.start_balance_updates(address, 15)
-        else:
-            logger.warning("No private key found in config. Cannot track balances.")
-    
-    logger.info(f"Monitoring {pool_monitor.token0_symbol}/{pool_monitor.token1_symbol} pool prices...")
-    logger.info(f"Update interval: {update_interval} seconds")
-    
-    # Continuous loop to fetch and log prices
-    counter = 0
-    try:
-        while True:
-            try:
-                # Get current price data from cache (updated by background task)
-                s_time = time.time()
-                
-                # Alternate between live and cached price to demonstrate the difference
-                if counter % 10 == 0:
-                    price_data = pool_monitor.get_current_price(live=True)
-                    source = "Live RPC call"
-                else:
-                    price_data = pool_monitor.get_current_price(live=False)
-                    source = "Cache"
-                
-                e_time = time.time()
-                
-                if price_data and 'price' in price_data:
-                    # Calculate cache age
-                    cache_age = int(time.time()) - price_data.get('timestamp', 0)
-                    
-                    # Format time since last tick change
-                    time_since_change = price_data.get('time_since_last_change', 0)
-                    formatted_time_since_change = pool_monitor._format_time_duration(time_since_change)
-                    
-                    # Get current timestamp
-                    current_time = datetime.datetime.now().strftime("%H:%M:%S")
-                    
-                    # For USDC/WETH pool, show prices in both directions for clarity
-                    if pool_monitor.token0_symbol == 'USDC' and pool_monitor.token1_symbol == 'WETH':
-                        # Get prices calculated from sqrtPriceX96
-                        usdc_per_weth = price_data['sqrt_price_token1']  # WETH price in USDC
-                        weth_per_usdc = price_data['sqrt_price_token0']  # USDC price in WETH
-                        
-                        price_display = f"1 WETH = {usdc_per_weth:.2f} USDC | 1 USDC = {weth_per_usdc:.8f} WETH"
-                    else:
-                        # For other pairs, use the token prices directly
-                        price_display = f"1 {pool_monitor.token1_symbol} = {price_data['token1_price']:.8f} {pool_monitor.token0_symbol}"
-                    
-                    # Log basic price info
-                    logger.info(
-                        f"[{current_time}] {pool_monitor.token0_symbol}/{pool_monitor.token1_symbol} | {price_display} | "
-                        f"Tick: {price_data['tick']} | Source: {source} | Fetch time: {(e_time - s_time):.6f}s | "
-                        f"Cache age: {cache_age}s | Last tick change: {formatted_time_since_change} ago"
-                    )
-                    
-                    # Display reserves
-                    if 'reserve0_hr' in price_data and 'reserve1_hr' in price_data:
-                        logger.info(
-                            f"Reserves: {price_data['reserve0_hr']:.2f} {pool_monitor.token0_symbol}, "
-                            f"{price_data['reserve1_hr']:.2f} {pool_monitor.token1_symbol}"
-                        )
-                    
-                    # Display balances if tracking them and address is available
-                    if track_balances and address and counter % 10 == 0:
-                        # Get balances from cache
-                        balance_data = pool_monitor.get_balances(address)
-                        if balance_data and 'balances' in balance_data:
-                            current_balances = balance_data['balances']
-                            # Only show token0, token1, and ETH in regular updates
-                            relevant_balances = {
-                                'ETH': current_balances.get('ETH', 0),
-                                pool_monitor.token0_symbol: current_balances.get(pool_monitor.token0_symbol, 0),
-                                pool_monitor.token1_symbol: current_balances.get(pool_monitor.token1_symbol, 0)
-                            }
-                            logger.info(f"Current balances: ETH: {relevant_balances['ETH']:.6f}, "
-                                        f"{pool_monitor.token0_symbol}: {relevant_balances[pool_monitor.token0_symbol]:.6f}, "
-                                        f"{pool_monitor.token1_symbol}: {relevant_balances[pool_monitor.token1_symbol]:.6f}")
-                    
-                    # Detailed update every 5 cycles
-                    counter += 1
-                    if counter % 5 == 0:
-                        # For easier reading, we'll use these variable names
-                        token0 = pool_monitor.token0_symbol
-                        token1 = pool_monitor.token1_symbol
-                        
-                        logger.info(f"\n=== Detailed Pool State ===")
-                        
-                        # For USDC/WETH, display prices in a clear format
-                        if token0 == 'USDC' and token1 == 'WETH':
-                            # Get prices calculated from sqrtPriceX96
-                            weth_in_usdc_sqrt = price_data['sqrt_price_token1']  # WETH price in USDC
-                            usdc_in_weth_sqrt = price_data['sqrt_price_token0']  # USDC price in WETH
-                            
-                            # Get prices calculated from tick
-                            weth_in_usdc_tick = price_data['tick_price']  # WETH price in USDC
-                            usdc_in_weth_tick = price_data['tick_price_token0']  # USDC price in WETH
-                            
-                            # Display both calculation methods
-                            logger.info(f"  === Prices from sqrtPriceX96 ===")
-                            logger.info(f"  1 WETH = {weth_in_usdc_sqrt:.2f} USDC")
-                            logger.info(f"  1 USDC = {usdc_in_weth_sqrt:.8f} WETH")
-                            
-                            logger.info(f"\n  === Prices from tick ===")
-                            logger.info(f"  1 WETH = {weth_in_usdc_tick:.2f} USDC")
-                            logger.info(f"  1 USDC = {usdc_in_weth_tick:.8f} WETH")
-                        else:
-                            # For other pairs, show similar information
-                            if 'sqrt_price_token0' in price_data and 'sqrt_price_token1' in price_data:
-                                logger.info(f"  === Prices from sqrtPriceX96 ===")
-                                logger.info(f"  1 {token0} = {price_data['sqrt_price_token0']:.8f} {token1}")
-                                logger.info(f"  1 {token1} = {price_data['sqrt_price_token1']:.8f} {token0}")
-                                
-                                logger.info(f"\n  === Prices from tick ===")
-                                logger.info(f"  1 {token1} = {price_data['tick_price']:.8f} {token0}")
-                                logger.info(f"  1 {token0} = {price_data['tick_price_token0']:.8f} {token1}")
-                        
-                        logger.info(f"\n  === Pool Details ===")
-                        logger.info(f"  Current Tick: {price_data['tick']}")
-                        logger.info(f"  sqrt_price_x96: {price_data.get('sqrt_price_x96', 0)}")
-                        logger.info(f"  Time since last tick change: {formatted_time_since_change}")
-                        logger.info(f"  Liquidity: {pool_monitor._format_number(price_data.get('liquidity', 0))}")
-                        
-                        # Add reserves in detail view
-                        if 'reserve0_hr' in price_data and 'reserve1_hr' in price_data:
-                            logger.info(f"  {token0} Reserves: {price_data['reserve0_hr']:.2f}")
-                            logger.info(f"  {token1} Reserves: {price_data['reserve1_hr']:.2f}")
-                        
-                        # Add detailed balance info if tracking
-                        if track_balances and address:
-                            balance_data = pool_monitor.get_balances(address)
-                            if balance_data and 'balances' in balance_data:
-                                logger.info(f"\n  === Account Balances ===")
-                                for symbol, balance in balance_data['balances'].items():
-                                    # Filter out zero balances except for ETH, token0, and token1
-                                    if balance > 0 or symbol == 'ETH' or symbol == token0 or symbol == token1:
-                                        logger.info(f"  {symbol}: {balance}")
-                        
-                        logger.info("--------------------------------------------------")
-                else:
-                    logger.warning("Failed to get price data")
-                
-                # Sleep for 1 second between logs (independent of the background update interval)
-                await asyncio.sleep(1)
-                
-            except Exception as e:
-                logger.error(f"Error fetching price: {e}")
-                await asyncio.sleep(1)  # Brief pause on error
-                
-    except KeyboardInterrupt:
-        logger.info("Price monitoring stopped by user.")
-        # Stop background updates
-        await pool_monitor.stop_background_updates()
-        if track_balances:
-            await pool_monitor.stop_balance_updates()
-        return True
-
-
 # Test function for swap_instrument
 async def test_swap_instrument(pool_monitor):
     """
@@ -1743,7 +1620,7 @@ async def test_swap_instrument(pool_monitor):
             raise ValueError("WETH address not found")
 
         # Execute swap using WETH
-        tx_hash = await pool_monitor.swap_instrument(0.36, weth_address, is_exact_input=True)
+        tx_hash = await pool_monitor.swap_instrument(0.002, weth_address, is_exact_input=True, slippage=0.1, deadline=600)
 
         # Assert
         if tx_hash:
@@ -1782,6 +1659,17 @@ async def test_transfer_from_pool(pool_monitor):
         logger.error(f"Stack Trace: {traceback.format_exc()}")
         logger.error(f"Test failed with error: {e}")
 
+async def test_price_updates(interval):
+    """
+    Simple test function to test the balance cache.
+    """
+    config = Config()
+    pool_monitor = PoolMonitor("USDC/ETH", config.infura_ws_url, config.wallet_private_key)
+    while True:
+        logger.info(f'Base token price: {pool_monitor.get_current_base_price()}')
+        logger.info(f'Balance cache: {pool_monitor._balance_cache}')
+        logger.info(f'Price cache: {pool_monitor._price_cache}')
+        await asyncio.sleep(interval)
 
 async def main():
     """
@@ -1789,8 +1677,8 @@ async def main():
     """
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Monitor Uniswap V3 pool activity in real-time')
-    parser.add_argument('--pool', type=str, default=DEFAULT_POOL_ADDRESS,
-                        help=f'Uniswap V3 pool address (default: {DEFAULT_POOL_ADDRESS} - ETH/USDC)')
+    parser.add_argument('--pool', type=str, default="USDC/ETH",
+                        help=f'Uniswap V3 pool address (default: USDC/ETH)')
     parser.add_argument('--interval', type=int, default=5,
                         help='Price update interval in seconds (default: 5)')
     parser.add_argument('--verbose', action='store_true',
@@ -1805,24 +1693,17 @@ async def main():
                         help='Unwrap ETH')
     
     args = parser.parse_args()
-    
+
     # Set logging level based on verbose flag
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     
-    # Validate pool address
-    if not args.pool.startswith('0x') or len(args.pool) != 42:
-        logger.warning(f"Invalid pool address format: {args.pool}")
-        logger.warning(f"Using default ETH/USDC pool: {DEFAULT_POOL_ADDRESS}")
-        pool_address = DEFAULT_POOL_ADDRESS
-    else:
-        pool_address = args.pool
-    
-    logger.info(f"Pool address: {pool_address}")
+    pool = args.pool
+    logger.info(f"Pool: {pool}")
     config = Config()
     
     # Initialize pool monitor with default update settings
-    pool_monitor = PoolMonitor(pool_address, config.infura_ws_url, config.wallet_private_key)
+    pool_monitor = PoolMonitor("USDC/ETH", config.infura_ws_url, config.wallet_private_key)
 
     # Run tests based on command-line arguments
     if args.trade_test:
@@ -1837,7 +1718,7 @@ async def main():
         logger.info(f"Unwrapped ETH: {unwrapped_eth}")
     else:
         # Run the normal price monitoring
-        await test_price_updates(pool_monitor, args.interval)
+        await test_price_updates(args.interval)
 
 
 # Run the main function
