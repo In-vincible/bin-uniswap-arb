@@ -75,10 +75,9 @@ class ArbitrageStrategy:
             return await self.binance.verify_withdrawal_open(self.base_token)
 
     async def _compute_expected_transfer_tx(self, arb_size: float, uniswap_trade_direction: str):
-        from_address = self.uniswap.wallet_address
-        to_address = await self.binance.get_deposit_address(self.base_token)
-        logger.info(f"uniswap wallet address: {from_address}, binance deposit address: {to_address}")
-        if uniswap_trade_direction == 'buy':
+        from_address = self.quote_token_address
+        to_address = self.base_token_address
+        if uniswap_trade_direction == 'sell':
             from_address, to_address = to_address, from_address
         tx = Transaction(
                             from_address=from_address,
