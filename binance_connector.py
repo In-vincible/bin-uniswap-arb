@@ -299,7 +299,10 @@ class Binance:
         """
         # Implement trade confirmation logic here
         # This is a placeholder implementation
-        return trade["trade_size"]
+        if trade and 'trade_size' in trade:
+            return trade["trade_size"]
+        else:
+            return 0
 
     async def initiate_transfer(self, transfer_direction, transfer_amount, from_address, to_address):
         """

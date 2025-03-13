@@ -42,9 +42,9 @@ class ArbitrageStrategy:
         if self.arb_config['execution_mode'] == 'both':
             return price_difference > self.arb_config['min_price_dislocation_bps']
         elif self.arb_config['execution_mode'] == 'binance_to_uniswap':
-            return uniswap_price > binance_price * (1 + self.arb_config['min_price_dislocation_bps'] / 100)
+            return uniswap_price > binance_price * (1 + self.arb_config['min_price_dislocation_bps'] / 10_000)
         elif self.arb_config['execution_mode'] == 'uniswap_to_binance':
-            return binance_price > uniswap_price * (1 + self.arb_config['min_price_dislocation_bps'] / 100)
+            return binance_price > uniswap_price * (1 + self.arb_config['min_price_dislocation_bps'] / 10_000)
     
     async def compute_arb_size(self, uniswap_price: float, binance_price: float, uniswap_trade_direction: str):
         binance_trade_direction = 'buy' if uniswap_trade_direction == 'sell' else 'sell'
