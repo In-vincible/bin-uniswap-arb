@@ -43,6 +43,7 @@ NOTE: Check `validate_arbitrage_opportunity` function in `arb_strategy.py`
 ```
 pip install -r requirements.txt
 Setup config.json in root directory of repo as instructed below. (Can disable simulation if block native API absent.)
+export PYTHONPATH=$PYTHONPATH:$(pwd)
 python arb_strategy.py
 ```
 

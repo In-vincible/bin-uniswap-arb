@@ -1,8 +1,7 @@
 import asyncio
-from binance_connector import Binance
+from exchanges import Binance, Uniswap
 from blocknative_simulator import BlocknativeSimulator
 from execution_engine import ExecutionEngine
-from uniswap_connector import PoolMonitor
 from config import Config
 from token_monitoring import TokenMonitor, Transaction
 import logging
@@ -29,7 +28,7 @@ class ArbitrageStrategy:
         self.quote_token_address = instrument_config['quote_token_address']
         self.arb_config = config.arb_config
         self.binance = Binance(config.binance_api_key, config.binance_api_secret, instrument_config['binance_instrument'])
-        self.uniswap = PoolMonitor(instrument_config['uniswap_instrument'], config.infura_ws_url, config.wallet_private_key)
+        self.uniswap = Uniswap(config.infura_url, config.infura_ws_url, instrument_config['pool_address'], config.wallet_private_key)
         self.token_monitor = TokenMonitor([instrument_config['base_token_address'], instrument_config['quote_token_address']], config.infura_url)
         self.blocknative_simulator = BlocknativeSimulator(config.blocknative_api_key)
     
@@ -226,8 +225,8 @@ class ArbitrageStrategy:
         await self.token_monitor.start_monitoring()
 
         while True:
-            binance_price = self.binance.get_current_base_price(self.binance_instrument)
-            uniswap_price = self.uniswap.get_current_base_price()
+            binance_price = self.binance.get_current_price(self.base_token)
+            uniswap_price = self.uniswap.get_current_price(self.base_token)
             logger.info(f"Binance price: {binance_price}, Uniswap price: {uniswap_price}")
             if binance_price and uniswap_price:
                 if await self.validate_arbitrage_opportunity(uniswap_price, binance_price):
