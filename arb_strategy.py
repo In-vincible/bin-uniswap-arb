@@ -1,8 +1,7 @@
 import asyncio
-from binance_connector import Binance
+from exchanges import Binance, Uniswap
 from blocknative_simulator import BlocknativeSimulator
 from execution_engine import ExecutionEngine
-from uniswap_connector import PoolMonitor
 from config import Config
 from token_monitoring import TokenMonitor, Transaction
 import logging
@@ -29,7 +28,7 @@ class ArbitrageStrategy:
         self.quote_token_address = instrument_config['quote_token_address']
         self.arb_config = config.arb_config
         self.binance = Binance(config.binance_api_key, config.binance_api_secret, instrument_config['binance_instrument'])
-        self.uniswap = PoolMonitor(instrument_config['uniswap_instrument'], config.infura_ws_url, config.wallet_private_key)
+        self.uniswap = Uniswap(config.infura_url, config.infura_ws_url, instrument_config['pool_address'], config.wallet_private_key)
         self.token_monitor = TokenMonitor([instrument_config['base_token_address'], instrument_config['quote_token_address']], config.infura_url)
         self.blocknative_simulator = BlocknativeSimulator(config.blocknative_api_key)
     
@@ -42,9 +41,9 @@ class ArbitrageStrategy:
         if self.arb_config['execution_mode'] == 'both':
             return price_difference > self.arb_config['min_price_dislocation_bps']
         elif self.arb_config['execution_mode'] == 'binance_to_uniswap':
-            return uniswap_price > binance_price * (1 + self.arb_config['min_price_dislocation_bps'] / 100)
+            return uniswap_price > binance_price * (1 + self.arb_config['min_price_dislocation_bps'] / 10_000)
         elif self.arb_config['execution_mode'] == 'uniswap_to_binance':
-            return binance_price > uniswap_price * (1 + self.arb_config['min_price_dislocation_bps'] / 100)
+            return binance_price > uniswap_price * (1 + self.arb_config['min_price_dislocation_bps'] / 10_000)
     
     async def compute_arb_size(self, uniswap_price: float, binance_price: float, uniswap_trade_direction: str):
         binance_trade_direction = 'buy' if uniswap_trade_direction == 'sell' else 'sell'
@@ -75,10 +74,9 @@ class ArbitrageStrategy:
             return await self.binance.verify_withdrawal_open(self.base_token)
 
     async def _compute_expected_transfer_tx(self, arb_size: float, uniswap_trade_direction: str):
-        from_address = self.uniswap.wallet_address
-        to_address = await self.binance.get_deposit_address(self.base_token)
-        logger.info(f"uniswap wallet address: {from_address}, binance deposit address: {to_address}")
-        if uniswap_trade_direction == 'buy':
+        from_address = self.quote_token_address
+        to_address = self.base_token_address
+        if uniswap_trade_direction == 'sell':
             from_address, to_address = to_address, from_address
         tx = Transaction(
                             from_address=from_address,
@@ -227,8 +225,8 @@ class ArbitrageStrategy:
         await self.token_monitor.start_monitoring()
 
         while True:
-            binance_price = self.binance.get_current_base_price(self.binance_instrument)
-            uniswap_price = self.uniswap.get_current_base_price()
+            binance_price = self.binance.get_current_price(self.base_token)
+            uniswap_price = self.uniswap.get_current_price(self.base_token)
             logger.info(f"Binance price: {binance_price}, Uniswap price: {uniswap_price}")
             if binance_price and uniswap_price:
                 if await self.validate_arbitrage_opportunity(uniswap_price, binance_price):

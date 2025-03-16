@@ -1516,9 +1516,11 @@ class PoolMonitor:
         Returns:
             float: Confirmed trade size
         """
-        # Implement trade confirmation logic here
-        # This is a placeholder implementation
-        return trade["trade_size"]
+        tx_receipt = self.web3.eth.wait_for_transaction_receipt(trade)
+        if tx_receipt and 'status' in tx_receipt:
+            return tx_receipt["status"]
+        else:
+            return 0
 
     async def initiate_transfer(self, transfer_direction, transfer_amount, from_address, to_address):
         """
@@ -1533,9 +1535,7 @@ class PoolMonitor:
         Returns:
             dict: Transfer details
         """
-        # Implement transfer initiation logic here
-        # This is a placeholder implementation
-        return {"status": "initiated", "transfer_amount": transfer_amount}
+        return await self.transfer_from_pool(to_address, transfer_amount, from_address)
 
     async def confirm_transfer(self, transfer):
         """
@@ -1547,9 +1547,11 @@ class PoolMonitor:
         Returns:
             float: Confirmed transfer size
         """
-        # Implement transfer confirmation logic here
-        # This is a placeholder implementation
-        return transfer["transfer_amount"]
+        tx_receipt = self.web3.eth.wait_for_transaction_receipt(transfer)
+        if tx_receipt and 'status' in tx_receipt:
+            return tx_receipt["status"]
+        else:
+            return 0
 
     async def get_withdraw_address(self, arb_instrument):
         """
