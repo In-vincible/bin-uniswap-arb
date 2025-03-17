@@ -116,11 +116,11 @@ class ArbitrageStrategy(BaseStrategy):
             return False
 
         # Preliminary checks for transfers and network conditions/block congestions
-        if not await self.binance.pre_validate_transfers(self.binance.base_asset, analysis_result["arb_size"]):
+        if not await self.binance.pre_validate_transfers(self.binance.base_asset, analysis_result["arb_size"], max_transfer_time_seconds=self.arb_config["max_transfer_time_seconds"]):
             self.logger.info("Binance transfer validation failed")
             return False
         
-        if not await self.uniswap.pre_validate_transfers(self.uniswap.base_asset, analysis_result["arb_size"]):
+        if not await self.uniswap.pre_validate_transfers(self.uniswap.base_asset, analysis_result["arb_size"], max_transfer_time_seconds=self.arb_config["max_transfer_time_seconds"]):
             self.logger.info("Uniswap transfer validation failed")
             return False
     
