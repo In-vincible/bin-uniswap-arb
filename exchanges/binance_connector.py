@@ -364,7 +364,7 @@ class Binance(BaseExchange):
         balances = await self.get_balances(live=live)
         return float(balances[symbol])
     
-    async def confirm_deposit(self, asset: str, amount: float, tolerance: float = 1e-6, timeout_seconds: int = 120) -> float:
+    async def confirm_deposit(self, asset: str, amount: float, tolerance: float = 1e-6, timeout_seconds: int = 600) -> float:
         """
         Confirm that a deposit was completed and return the confirmed size.
         """
@@ -374,8 +374,8 @@ class Binance(BaseExchange):
         while True:
             deposit_history = await self.get_deposit_history(asset)
             for deposit in deposit_history:
-                if deposit['amount'] - amount <= tolerance:
-                    return deposit['amount']
+                if float(deposit['amount']) - float(amount) <= tolerance:
+                    return float(deposit['amount'])
             await asyncio.sleep(2)
             if time.time() - start_time > timeout_seconds:
                 return 0
@@ -482,13 +482,13 @@ class Binance(BaseExchange):
         """
         Not required for Binance.
         """
-        pass
+        return amount
     
     async def unwrap_asset(self, asset: str, amount: float) -> float:
         """
         Not required for Binance.
         """
-        pass
+        return amount
 
 # --- Async test code in __main__ ---
 async def main():
@@ -512,8 +512,8 @@ async def main():
     logger.info(f"All prices: {all_prices}")
 
     # Example: Get deposit address
-    deposit_address = await connector.get_deposit_address("ETH")
-    logger.info(f"Deposit address: {deposit_address}")
+    deposit_address = await connector.get_deposit_address("USDC")
+    logger.info(f"Deposit address (USDC): {deposit_address}")
 
     # Example: Place a market buy order for ETHUSDC (0.005 quantity)
     test_trade = False
@@ -618,7 +618,7 @@ async def main():
     # Example: Confirm deposit
     try:
         asset = "ETH"
-        amount = 0.002
+        amount = 0.004995930032057706
         confirmed_deposit = await connector.confirm_deposit(asset, amount)
         logger.info(f"Confirmed deposit: {confirmed_deposit}")
     except Exception as e:
