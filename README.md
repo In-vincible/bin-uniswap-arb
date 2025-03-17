@@ -26,6 +26,19 @@ Profitability is calculated after considering below costs
 1. [Binance](https://github.com/AcheronTrading/acheron-tech-interview-invincible/blob/main/exchanges/binance_connector.py#L415): slippage (last price against bid(sell)/ask(buy)), withrawal fee, taker fee
 2. [Uniswap](https://github.com/AcheronTrading/acheron-tech-interview-invincible/blob/main/exchanges/uniswap_connector.py#L1331): slippage (on the basis of current liquidity available in tick so that we don't cross tick in either direction), wrap/unwrap gas cost, transfer gas cost, pool fee (static fee of pool), swap gas cost
 
+
+## [Execution Path](https://github.com/AcheronTrading/acheron-tech-interview-invincible/blob/main/execution_engine.py#L9)
+
+1. Execute buy
+2. Confirm buy execution
+3. Unwrap base asset if necessary
+4. Transfer bought assets to sell venue
+5. Confirm Withdrawal
+6. Confirm Deposit
+7. Wrap base asset if necessary
+8. Execute sell on sell venue
+9. Confirm Sell
+
 ## Issues with code and suggested enhancements
 
 1. **Better Size Calculation**: Currently, an estimation is taken as TOB for Binance and 0.1% of reserve, ideal solution should be done using weighted orderbook price from binance, and [If 2nd is done] estimated best price from uniswap to maintain min profit rate defined in config.
