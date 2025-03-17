@@ -101,13 +101,13 @@ class BaseExchange(abc.ABC):
         raise NotImplementedError()
     
     @abc.abstractmethod
-    async def confirm_deposit(self, asset: str, amount: float) -> float:
+    async def confirm_deposit(self, tx_id: str, timeout_seconds: int = 120) -> float:
         """
         Confirm that a deposit was completed and return the confirmed size.
 
         Args:
-            asset: The asset code (e.g., 'ETH')
-            amount: The amount of the deposit
+            tx_id: The transaction id of the deposit
+            timeout_seconds: The timeout for the deposit confirmation
 
         Returns:
         """

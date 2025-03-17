@@ -503,7 +503,7 @@ class Uniswap(BaseExchange):
         tick_upper = mint_event.args.tickUpper
         if tick_lower <= self.tick and tick_upper >= self.tick:
             self.liquidity += mint_event.args.amount
-            self.log_current_state()
+            logger.info(f'liquidity: {self.liquidity}')
         else:
             logger.info(f"Mint event is not within the tick boundaries: {tick_lower} <= {self.tick} <= {tick_upper}")
     
@@ -516,7 +516,7 @@ class Uniswap(BaseExchange):
         tick_upper = burn_event.args.tickUpper
         if tick_lower <= self.tick and tick_upper >= self.tick:
             self.liquidity -= burn_event.args.amount
-            self.log_current_state()
+            logger.info(f'liquidity: {self.liquidity}')
         else:
             logger.info(f"Burn event is not within the tick boundaries: {tick_lower} <= {self.tick} <= {tick_upper}")
         
@@ -535,7 +535,6 @@ class Uniswap(BaseExchange):
         logger.info(f"Lower tick: {lower_tick}, Upper tick: {upper_tick}")
         logger.info(f"Sqrt price lower: {sqrt_price_lower}, Sqrt price upper: {sqrt_price_upper}")
         assert sqrt_price_lower <= self.sqrt_price <= sqrt_price_upper, "sqrtPriceX96 is not within the tick boundaries"
-        self.log_current_state()
 
     def log_current_state(self):
         # Compute max theoretical size of the position within the tick boundaries
@@ -713,13 +712,6 @@ class Uniswap(BaseExchange):
                         
                         logger.info(f"Found token transfer to user: {amount} {token_info.symbol}")
                         return amount
-            
-            # If we get here, we couldn't find a relevant token transfer
-            # Let's try an alternative approach - check all logs
-            for i, log in enumerate(tx_receipt.logs):
-                logger.info(f"Log {i}: address={log.address}, topics={[t.hex() for t in log.topics]}")
-                if hasattr(log, 'data'):
-                    logger.info(f"  data={log.data.hex()}")
             
             logger.warning("No token transfers to user found in transaction logs")
             return 0
@@ -1215,7 +1207,7 @@ class Uniswap(BaseExchange):
         if trade_direction.upper() == "BUY":
             token_in_address = self.get_asset_address(self.quote_asset)
             current_balance = await self.get_balance(self.quote_asset)
-            amount_in = trade_size * await self.get_current_price(self.quote_asset)
+            amount_in = trade_size * await self.get_base_asset_price()
             amount_in = min(amount_in, current_balance)
 
         if self.enable_flash_bot:
@@ -1599,7 +1591,7 @@ async def main():
             logger.info(f"Trade response: {tx_hash}")
 
         # Test Tradeconfirmation
-        test_confirm_trade = True
+        test_confirm_trade = False
         if test_confirm_trade:
             confirmed_amount = await uniswap.confirm_trade(tx_hash)
             logger.info(f"Confirmed amount: {confirmed_amount}")

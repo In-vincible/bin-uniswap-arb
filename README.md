@@ -10,11 +10,10 @@ The arbitrage strategy is based on the following conditions and validations:
 
 - **Price dislocation Check**: The bot price dislocations b/w binance and uniswap. 
 - **Slippage Tolerance**: The bot accounts for slippage, ensuring that the price movement during the trade does not erode the expected profit.
-- **Gas Fee and transaction costs limit**: Trades are validated against a maximum gas fee limit to ensure that transaction costs do not outweigh the benefits.
-- **Order Size Limit**: The bot restricts the size of each order to a predefined limit to manage risk and liquidity.
-- **Simulation**: block native simulation to get more accurate transaction costs.
+- **Gas Fee and transaction costs limit**: Wrap, Unwrap, Transfer, Swap gas costs are factored in.
+- **Order Size Limit**: The bot restricts the size of each order to a predefined limit to manage risk and liquidity. (tob in binance and available liquidity)
+- **Network health checks**: Network status, congestion check, transfer time checks against config.
 
-NOTE: Check `validate_arbitrage_opportunity` function in `arb_strategy.py`
 
 ## Issues with code and suggested enhancements
 

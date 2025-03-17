@@ -227,7 +227,7 @@ class Binance(BaseExchange):
         Raises:
             Exception: If the API call fails or the asset is not supported
         """
-        return self.deposit_addresses[asset]
+        return self.deposit_addresses[asset]['address']
 
     async def withdraw(self, asset: str, address: str, amount, network: str = "ETH"):
         params = {"coin": asset, "address": address, "amount": amount}
@@ -364,14 +364,21 @@ class Binance(BaseExchange):
         balances = await self.get_balances(live=live)
         return float(balances[symbol])
     
-    async def confirm_deposit(self, asset: str, amount: float, tolerance: float = 1e-6) -> float:
+    async def confirm_deposit(self, asset: str, amount: float, tolerance: float = 1e-6, timeout_seconds: int = 120) -> float:
         """
         Confirm that a deposit was completed and return the confirmed size.
         """
-        deposit_history = await self.get_deposit_history(asset)
-        for deposit in deposit_history:
-            if abs(float(deposit['amount']) - amount) <= tolerance:
-                return float(deposit['amount'])
+        logger.info(f"Confirming deposit for {asset} {amount}")
+
+        start_time = time.time()
+        while True:
+            deposit_history = await self.get_deposit_history(asset)
+            for deposit in deposit_history:
+                if deposit['amount'] - amount <= tolerance:
+                    return deposit['amount']
+            await asyncio.sleep(2)
+            if time.time() - start_time > timeout_seconds:
+                return 0
         return 0
     
     async def confirm_withdrawal(self, withdrawal_info: Dict[str, Any]):
@@ -385,7 +392,7 @@ class Binance(BaseExchange):
                 return withdrawal['amount']
             elif withdrawal['status'] == 3:
                 return 0
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(2)
     
     async def pre_validate_transfers(self, asset: str, amount: float, max_transfer_time_seconds: int = 10) -> bool:
         """
@@ -504,6 +511,10 @@ async def main():
     all_prices = connector.get_all_prices()
     logger.info(f"All prices: {all_prices}")
 
+    # Example: Get deposit address
+    deposit_address = await connector.get_deposit_address("ETH")
+    logger.info(f"Deposit address: {deposit_address}")
+
     # Example: Place a market buy order for ETHUSDC (0.005 quantity)
     test_trade = False
     if test_trade:
@@ -606,9 +617,9 @@ async def main():
     
     # Example: Confirm deposit
     try:
-        deposit_asset = "ETH"
-        deposit_amount = 0.002
-        confirmed_deposit = await connector.confirm_deposit(deposit_asset, deposit_amount)
+        asset = "ETH"
+        amount = 0.002
+        confirmed_deposit = await connector.confirm_deposit(asset, amount)
         logger.info(f"Confirmed deposit: {confirmed_deposit}")
     except Exception as e:
         logger.info(f"Error confirming deposit: {e}")
