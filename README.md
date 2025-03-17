@@ -54,7 +54,7 @@ Profitability is calculated after considering below costs
 pip install -r requirements.txt
 Setup config.json in root directory of repo as instructed below. (Can disable simulation if block native API absent.)
 export PYTHONPATH=$PYTHONPATH:$(pwd)
-python arb_strategy.py
+python trading_engine.py
 ```
 
 ## Configuration File (`config.json`)
