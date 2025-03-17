@@ -14,6 +14,17 @@ The arbitrage strategy is based on the following conditions and validations:
 - **Order Size Limit**: The bot restricts the size of each order to a predefined limit to manage risk and liquidity. (tob in binance and available liquidity)
 - **Network health checks**: Network status, congestion check, transfer time checks against config.
 
+## Detailed Info on pre-validations
+
+1. Capital check (verify if buy exchange has sufficient quote tokens USDC, USDT etc to fund buy trade)
+2. Binance checks: deposit/withdrawal open, quantity above min withdrawal amount
+3. Uniswap checks: Network is up, Congestion check: transactions are happening in realtime and aren't stuck, recent transaction on network is below min_tranfer_time in config
+
+## Detailed Info on profitability checks (as per cost)
+
+Profitability is calculated after considering below costs
+1. Binance: slippage (last price against bid(sell)/ask(buy)), withrawal fee, taker fee
+2. Uniswap: slippage (on the basis of current liquidity available in tick so that we don't cross tick in either direction), wrap/unwrap gas cost, transfer gas cost, pool fee (static fee of pool), swap gas cost
 
 ## Issues with code and suggested enhancements
 
@@ -64,7 +75,6 @@ The `config.json` file contains essential parameters and API keys required for t
     "uniswap_address": "your_uniswap_address",
     "infura_url": "https://mainnet.infura.io/v3/your_infura_project_id",
     "infura_ws_url": "wss://mainnet.infura.io/ws/v3/your_infura_project_id",
-    "blocknative_api_key": "your_blocknative_api_key",
     "instrument_config": [
         {
             "binance_instrument": "ETHUSDC",

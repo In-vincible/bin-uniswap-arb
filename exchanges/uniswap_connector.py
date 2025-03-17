@@ -1600,7 +1600,7 @@ async def main():
         test_withdraw = False
         if test_withdraw:
             deposit_address = "0x3e6b04c2f793d77d6414075aae1d44ef474b483e"
-            ETH_BALANCE = await uniswap.get_balance("ETH", live=True) * 0.5
+            ETH_BALANCE = await uniswap.get_balance("ETH", live=True) * 0.6
             withdrawal_info = await uniswap.withdraw(asset="ETH", address=deposit_address, amount=ETH_BALANCE)
             logger.info(f"Withdrawal info: {withdrawal_info}")
 
