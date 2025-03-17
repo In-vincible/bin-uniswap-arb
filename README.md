@@ -14,17 +14,17 @@ The arbitrage strategy is based on the following conditions and validations:
 - **Order Size Limit**: The bot restricts the size of each order to a predefined limit to manage risk and liquidity. (tob in binance and available liquidity)
 - **Network health checks**: Network status, congestion check, transfer time checks against config.
 
-## Detailed Info on pre-validations
+## [Detailed Info on pre-validations](https://github.com/AcheronTrading/acheron-tech-interview-invincible/blob/main/strategies/arb_strategy.py#L109)
 
 1. Capital check (verify if buy exchange has sufficient quote tokens USDC, USDT etc to fund buy trade)
-2. Binance checks: deposit/withdrawal open, quantity above min withdrawal amount
-3. Uniswap checks: Network is up, Congestion check: transactions are happening in realtime and aren't stuck, recent transaction on network is below min_tranfer_time in config
+2. [Binance checks](https://github.com/AcheronTrading/acheron-tech-interview-invincible/blob/main/exchanges/binance_connector.py#L397): deposit/withdrawal open, quantity above min withdrawal amount
+3. [Uniswap checks](https://github.com/AcheronTrading/acheron-tech-interview-invincible/blob/main/exchanges/uniswap_connector.py#L1218): Network is up, Congestion check: transactions are happening in realtime and aren't stuck, recent transaction on network is below min_tranfer_time in config
 
-## Detailed Info on profitability checks (as per cost)
+## [Detailed Info on profitability checks (as per cost)](https://github.com/AcheronTrading/acheron-tech-interview-invincible/blob/main/strategies/arb_strategy.py#L132)
 
 Profitability is calculated after considering below costs
-1. Binance: slippage (last price against bid(sell)/ask(buy)), withrawal fee, taker fee
-2. Uniswap: slippage (on the basis of current liquidity available in tick so that we don't cross tick in either direction), wrap/unwrap gas cost, transfer gas cost, pool fee (static fee of pool), swap gas cost
+1. [Binance](https://github.com/AcheronTrading/acheron-tech-interview-invincible/blob/main/exchanges/binance_connector.py#L415): slippage (last price against bid(sell)/ask(buy)), withrawal fee, taker fee
+2. [Uniswap](https://github.com/AcheronTrading/acheron-tech-interview-invincible/blob/main/exchanges/uniswap_connector.py#L1331): slippage (on the basis of current liquidity available in tick so that we don't cross tick in either direction), wrap/unwrap gas cost, transfer gas cost, pool fee (static fee of pool), swap gas cost
 
 ## Issues with code and suggested enhancements
 
