@@ -213,6 +213,7 @@ class BaseStrategy(ABC):
                 pass
             
         self.logger.info("Strategy stopped")
+        await self.cleanup()
     
     @abstractmethod
     async def get_state(self) -> Dict[str, Any]:

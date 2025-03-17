@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 import time
 import traceback
 from typing import Any, Dict
@@ -178,6 +179,21 @@ class Binance(BaseExchange):
         return self.market_data
 
     async def place_order(self, symbol: str, side: str, order_type: str, quantity, price=None):
+        """
+        Place an order on Binance.
+        """
+        # Round quantity according to the asset's precision to avoid Binance API errors
+        if symbol != self.metadata['symbol']:
+            raise ValueError(f"Symbol {symbol} not found in metadata")
+        
+        # Get the quantity precision from the metadata
+        lot_size_filter = next(filter(lambda x: x['filterType'] == 'LOT_SIZE', self.metadata['filters']))
+        step_size = float(lot_size_filter['stepSize'])
+        precision = len(str(step_size).split('.')[-1].rstrip('0'))
+        
+        # Round down to the correct precision
+        quantity = math.floor(quantity * (10 ** precision)) / (10 ** precision)
+
         if order_type.upper() == "MARKET":
             order = await self.client.create_order(
                 symbol=symbol,
@@ -214,7 +230,7 @@ class Binance(BaseExchange):
         return self.deposit_addresses[asset]
 
     async def withdraw(self, asset: str, address: str, amount, network: str = "ETH"):
-        params = {"asset": asset, "address": address, "amount": amount}
+        params = {"coin": asset, "address": address, "amount": amount}
         if network:
             params["network"] = network
         return await self.client.withdraw(**params)
@@ -457,7 +473,6 @@ class Binance(BaseExchange):
 async def main():
     config = Config()
     instrument = "ETHUSDC"
-    asset_list = ["ETH", "USDC"]
     base_asset = "ETH"
     quote_asset = "USDC"
     connector = Binance(config.binance_api_key, config.binance_api_secret, instrument, base_asset, quote_asset)
@@ -475,24 +490,50 @@ async def main():
     all_prices = connector.get_all_prices()
     logger.info(f"All prices: {all_prices}")
 
-    # Example: Place a market buy order for ETHUSDC (0.001 quantity)
-    try:
-        trade_response = await connector.place_order(
-            symbol="ETHUSDC",
-            side="BUY",
-            order_type="MARKET",
-            quantity=0.001
-        )
-        logger.info(f'Trade Order Response: {trade_response}')
-    except Exception as e:
-        logger.info(f"Error placing order: {e}")
+    # Example: Place a market buy order for ETHUSDC (0.005 quantity)
+    test_trade = False
+    if test_trade:
+        try:
+            trade_response = await connector.place_order(
+                symbol="ETHUSDC",
+                side="BUY",
+                order_type="MARKET",
+                quantity=0.005
+            )
+            logger.info(f'Trade Order Response: {trade_response}')
 
-    # Example: Get deposit address for USDT
-    try:
-        deposit_addr = await connector.get_deposit_address(asset="ETH")
-        logger.info(f"ETH Deposit Address: {deposit_addr}")
-    except Exception as e:
-        logger.info(f"Error fetching deposit address: {e}")
+            # Wait for the order to be filled
+            await asyncio.sleep(1)
+
+            # Get the order status
+            ETH_BALANCE = await connector.get_balance(connector.base_asset, live=True)
+            logger.info(f"ETH Balance: {ETH_BALANCE}")
+
+            # Sell the ETH
+            sell_response = await connector.place_order(
+                symbol="ETHUSDC",
+                side="SELL",
+                order_type="MARKET",
+                quantity=ETH_BALANCE
+            )
+            logger.info(f'Sell Order Response: {sell_response}')
+
+        except Exception as e:
+            logger.info(f"Error placing order: {e}")
+
+    # Test withdrawals
+    test_withdrawals = False
+    if test_withdrawals:
+        try:
+            # Get deposit address for USDT
+            address = "0x94A5d421375c9486061f6835a11c81196470290C"
+            amount = ETH_BALANCE
+            withdrawal_response = await connector.withdraw(asset="ETH", address=address, amount=amount)
+            logger.info(f"Withdrawal Response: {withdrawal_response}")
+        except Exception as e:
+            logger.error(traceback.format_exc())
+            logger.info(f"Error withdrawing: {e}")
+
 
     # Example: Get deposit history for USDT
     try:

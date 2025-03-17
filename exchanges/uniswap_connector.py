@@ -1,4 +1,6 @@
+import json
 import math
+import time
 from typing import Any, Dict
 from web3 import Web3, AsyncWeb3
 from web3.providers.persistent import WebSocketProvider
@@ -812,12 +814,162 @@ class Uniswap(BaseExchange):
             if abs(transfer_amount - amount) <= tolerance:
                 return transfer_amount
     
+    async def swap_instrument(self, amount: float, token_address: str, slippage: float = 0.05, deadline: int = 60) -> str:
+        """
+        Execute a swap transaction using Uniswap V3 SwapRouter.
+        """
+        try:
+            # Define Uniswap V3 Router address
+            UNISWAP_V3_ROUTER = "0xE592427A0AEce92De3Edee1F18E0157C05861564"  # Mainnet SwapRouter
+            
+            # Verify token is in pool
+            token0 = self.metadata['token0'].address
+            token1 = self.metadata['token1'].address
+            token_address = self.async_w3.to_checksum_address(token_address)
+            
+            logger.info(f"Swap parameters: amount={amount}, token_address={token_address}")
+            logger.info(f"Pool tokens: token0={token0}, token1={token1}")
+            
+            if token_address not in [token0, token1]:
+                raise ValueError(f"Token address {token_address} must be one of the pool's tokens ({token0} or {token1})")
+            
+            # Determine which token is being swapped in/out
+            is_token0 = (token_address == token0)
+            token_in = token0 if is_token0 else token1
+            token_out = token1 if is_token0 else token0
+            
+            logger.info(f"Token in: {token_in}, Token out: {token_out}, Is token0: {is_token0}")
+            
+            # Get token contract and decimals
+            token_contract = self.async_w3.eth.contract(address=token_address, abi=self.erc20_abi)
+            decimals = self.get_asset_decimals(token_in)
+            logger.info(f"Token decimals: {decimals}")
+            
+            # Check token balance
+            token_balance = await token_contract.functions.balanceOf(self.account.address).call()
+            token_balance_human = token_balance / (10 ** decimals)
+            logger.info(f"Token balance: {token_balance_human} ({token_balance} wei)")
+            
+            # Convert amount to wei
+            amount_wei = int(amount * (10 ** decimals))
+            logger.info(f"Amount in wei: {amount_wei}")
+            
+            if token_balance < amount_wei:
+                logger.error(f"Insufficient token balance: {token_balance_human} < {amount}")
+                return None
+            
+            # Initialize router contract with ABI
+            router_abi = json.loads('''[
+                {"inputs":[{"components":[{"internalType":"address","name":"tokenIn","type":"address"},{"internalType":"address","name":"tokenOut","type":"address"},{"internalType":"uint24","name":"fee","type":"uint24"},{"internalType":"address","name":"recipient","type":"address"},{"internalType":"uint256","name":"deadline","type":"uint256"},{"internalType":"uint256","name":"amountIn","type":"uint256"},{"internalType":"uint256","name":"amountOutMinimum","type":"uint256"},{"internalType":"uint160","name":"sqrtPriceLimitX96","type":"uint160"}],"internalType":"struct ISwapRouter.ExactInputSingleParams","name":"params","type":"tuple"}],"name":"exactInputSingle","outputs":[{"internalType":"uint256","name":"amountOut","type":"uint256"}],"stateMutability":"payable","type":"function"},
+                {"inputs":[{"components":[{"internalType":"address","name":"tokenIn","type":"address"},{"internalType":"address","name":"tokenOut","type":"address"},{"internalType":"uint24","name":"fee","type":"uint24"},{"internalType":"address","name":"recipient","type":"address"},{"internalType":"uint256","name":"deadline","type":"uint256"},{"internalType":"uint256","name":"amountOut","type":"uint256"},{"internalType":"uint256","name":"amountInMaximum","type":"uint256"},{"internalType":"uint160","name":"sqrtPriceLimitX96","type":"uint160"}],"internalType":"struct ISwapRouter.ExactOutputSingleParams","name":"params","type":"tuple"}],"name":"exactOutputSingle","outputs":[{"internalType":"uint256","name":"amountIn","type":"uint256"}],"stateMutability":"payable","type":"function"}
+            ]''')
+            
+            router_contract = self.async_w3.eth.contract(
+                address=self.async_w3.to_checksum_address(UNISWAP_V3_ROUTER),
+                abi=router_abi
+            )
+            
+            # Check if token approval is needed
+            allowance = token_contract.functions.allowance(
+                self.account.address, 
+                self.async_w3.to_checksum_address(UNISWAP_V3_ROUTER)
+            ).call()
+            
+            logger.info(f"Current allowance: {allowance / (10 ** decimals)} ({allowance} wei)")
+            
+            if allowance < amount_wei:
+                logger.info(f"Approving router to spend {amount} tokens...")
+                # Need to approve the router to spend tokens
+                approve_tx = token_contract.functions.approve(
+                    self.async_w3.to_checksum_address(UNISWAP_V3_ROUTER),
+                    amount_wei * 2  # Approve more than needed
+                ).build_transaction({
+                    'from': self.account.address,
+                    'nonce': await self.async_w3.eth.get_transaction_count(self.account.address),
+                    'gas': 100000,  # Standard approval gas
+                    'gasPrice': await self.async_w3.eth.gas_price,
+                    'chainId': await self.async_w3.eth.chain_id
+                })
+                
+                # Sign and send approval transaction
+                signed_tx = self.async_w3.eth.account.sign_transaction(approve_tx, self.wallet_private_key)
+                approve_tx_hash = await self.async_w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+                
+                # Wait for approval
+                logger.info(f"Waiting for approval transaction {approve_tx_hash.hex()} to be confirmed...")
+                tx_receipt = await self.async_w3.eth.wait_for_transaction_receipt(approve_tx_hash)
+                logger.info(f"tx_receipt: {tx_receipt}")
+            
+            # Convert deadline from seconds to timestamp
+            deadline_timestamp = int(time.time()) + deadline
+            logger.info(f"Using deadline: {deadline_timestamp} (current time + {deadline} seconds)")
+            
+            
+            
+            # For WETH to USDC
+            if not is_token0:  # WETH is token1
+                expected_output = amount_wei * await self.get_current_price(self.metadata['token1'].symbol) / (10**6)  # Convert to USDC decimals
+            else:  # WETH is token0
+                expected_output = amount_wei * await self.get_current_price(self.metadata['token0'].symbol) / (10**6)
+                
+            # Apply slippage - 50% more than requested for safety
+            real_slippage = slippage * 1.5
+            min_output = int(expected_output * (1 - real_slippage))
+            
+            logger.info(f"Exact input swap: {amount} tokens in, expecting ~{expected_output/(10**6)} out")
+            logger.info(f"Min output with {real_slippage*100}% effective slippage: {min_output/(10**6)}")
+            
+            # Create transaction parameters
+            params = (
+                token_in,                # tokenIn
+                token_out,               # tokenOut
+                self.fee_tier,           # fee
+                self.account.address,     # recipient
+                deadline_timestamp,      # deadline
+                amount_wei,              # amountIn
+                min_output,              # amountOutMinimum
+                0                        # sqrtPriceLimitX96 (0 = no limit)
+            )
+            
+            # Build transaction
+            tx = router_contract.functions.exactInputSingle(params).build_transaction({
+                'from': self.account.address,
+                'nonce': await self.async_w3.eth.get_transaction_count(self.account.address),
+                'gas': 300000,  # Safe starting value
+                'value': 0,     # Not sending ETH directly
+                'chainId': await self.async_w3.eth.chain_id
+            })
+            
+            # Try to get gas estimate
+            try:
+                estimated_gas = await self.async_w3.eth.estimate_gas(tx)
+                tx['gas'] = estimated_gas
+                logger.info(f"Gas estimation successful: {estimated_gas}")
+            except Exception as e:
+                logger.error(f"Gas estimation failed: {str(e)}")
+                # Continue with default gas if estimation fails
+            
+            # Sign and send transaction
+            signed_tx = self.async_w3.eth.account.sign_transaction(tx, self.wallet_private_key)
+            tx_hash = await self.async_w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            logger.info(f"Swap transaction submitted: {tx_hash.hex()}")
+            
+            return tx_hash.hex()
+            
+        except Exception as e:
+            logger.error(f"Stack Trace: {traceback.format_exc()}")
+            logger.error(f"Swap failed: {str(e)}")
+            return None
+        
     async def execute_trade(self, trade_direction, trade_size):
         """
         Execute a trade.
         """
-        logger.info(f"Executing {trade_direction} trade of {trade_size}")
-        return trade_size
+        token_in_address = self.get_asset_address(self.base_asset)
+        if trade_direction.upper() == "SELL":
+            token_in_address = self.get_asset_address(self.quote_asset)
+
+        return await self.swap_instrument(trade_size, token_in_address)
     
     async def pre_validate_transfers(self, asset: str, amount: float, max_transfer_time_seconds: int = 10) -> bool:
         """
@@ -834,7 +986,7 @@ class Uniswap(BaseExchange):
             return False
         
         if transfer_status['estimate_seconds'] > max_transfer_time_seconds:
-            logger.warning(f"Transfer may take too long, consider increasing max_transfer_time_seconds")
+            logger.warning(f"Transfer may take too long, consider increasing max_transfer_time_seconds (estimated_transfer_time: {transfer_status['estimate_seconds']} seconds, max_transfer_time by config: {max_transfer_time_seconds} seconds)")
             return False
         
         return True

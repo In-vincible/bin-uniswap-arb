@@ -115,15 +115,15 @@ class TokenMonitor:
             logging.warning("Monitoring already started")
             return self._refresh_task
             
-        self._refresh_task = asyncio.create_task(self._refresh_loop())
-        self._gas_cache_refresh_task = asyncio.create_task(self._refresh_gas_cache_loop())
-        
         # Populate gas cache immediately
         if self.network_status:
             await self._refresh_gas_estimates()
         
         # Perform initial data refresh immediately
         await self.refresh_data()
+
+        self._refresh_task = asyncio.create_task(self._refresh_loop())
+        self._gas_cache_refresh_task = asyncio.create_task(self._refresh_gas_cache_loop())
                     
         logging.info("Token monitoring started with initial data")
         return self._refresh_task
