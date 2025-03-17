@@ -1,9 +1,7 @@
 import asyncio
 from exchanges import Binance, Uniswap
-from blocknative_simulator import BlocknativeSimulator
 from execution_engine import ExecutionEngine
 from config import Config
-from token_monitoring import TokenMonitor, Transaction
 import logging
 
 logger = logging.getLogger(__name__)
@@ -29,8 +27,6 @@ class ArbitrageStrategy:
         self.arb_config = config.arb_config
         self.binance = Binance(config.binance_api_key, config.binance_api_secret, instrument_config['binance_instrument'])
         self.uniswap = Uniswap(config.infura_url, config.infura_ws_url, instrument_config['pool_address'], config.wallet_private_key)
-        self.token_monitor = TokenMonitor([instrument_config['base_token_address'], instrument_config['quote_token_address']], config.infura_url)
-        self.blocknative_simulator = BlocknativeSimulator(config.blocknative_api_key)
     
     def is_price_dislocated(self, uniswap_price: float, binance_price: float):
         """
@@ -72,75 +68,11 @@ class ArbitrageStrategy:
             return await self.binance.verify_deposit_open(self.base_token)
         else:
             return await self.binance.verify_withdrawal_open(self.base_token)
-
-    async def _compute_expected_transfer_tx(self, arb_size: float, uniswap_trade_direction: str):
-        from_address = self.quote_token_address
-        to_address = self.base_token_address
-        if uniswap_trade_direction == 'sell':
-            from_address, to_address = to_address, from_address
-        tx = Transaction(
-                            from_address=from_address,
-                            to_address=to_address,
-                            value=arb_size,
-                            data="0x"  # Empty data for this example
-                        )
-        return tx
     
     async def _validate_network_congestion_gas_costs_and_possible_slippage(self, arb_size: float, uniswap_trade_direction: str, expected_profit: float):
-        if self.arb_config['disable_network_level_validations']:
-            logger.info("Network level validations disabled")
-            return True
-        
-        tx = await self._compute_expected_transfer_tx(arb_size, uniswap_trade_direction)
-        opportunity = await self.token_monitor.validate_arbitrage_opportunity(
-                        token_address=self.base_token_address,
-                        amount=arb_size,
-                        gas_limit=self.arb_config['gas_fee_limit'],
-                        expected_profit=expected_profit,
-                        max_wait_time=self.arb_config['max_transfer_time_seconds'],
-                        transaction=tx
-                    )
-        logger.info(f"Token monitor validation: {opportunity}")
-        if not opportunity['valid']:
-            logger.info(f"Token monitor validation failed, reason: {opportunity['reason']}")
-            return False
-        
-        logger.info(f"Arbitrage opportunity valid! Use gas price: {opportunity['gas_price']} wei")
-        logger.info(f"Expected profit after gas: {opportunity['profit_after_gas']} wei")
-        logger.info(f"Estimated wait time: {opportunity['estimated_time']} seconds")
         return True
     
     async def _simulate_transaction(self, arb_size: float, uniswap_trade_direction: str, expected_profit: float):
-        if self.arb_config['disable_blocknative_simulation']:
-            return True
-        
-        # Simulate the transaction
-        if uniswap_trade_direction == 'sell':
-            tx_data = {
-                "from": self.base_token_address,
-                "to": self.uniswap.wallet_address,
-                "value": arb_size,
-                "gas": self.arb_config['gas_fee_limit'],
-                "gasPrice": self.arb_config['gas_fee_limit']
-            }
-        else:
-            tx_data = {
-                "from": self.uniswap.wallet_address,
-                "to": self.base_token_address,
-                "value": arb_size,
-                "gas": self.arb_config['gas_fee_limit'],
-                "gasPrice": self.token_monitor.current_gas_price
-            }
-        simulation_result = self.blocknative_simulator.simulate_transaction(tx_data)
-        simulated_transaction_cost = simulation_result['total_estimated_cost']
-        base_token_decimals = await self.uniswap.get_base_token_decimals()
-        trade_size_wei = arb_size * (10**base_token_decimals)
-        transaction_cost_bps = simulated_transaction_cost / trade_size_wei * 10_000
-        logger.info(f'base token decimals: {base_token_decimals}, trade size wei: {trade_size_wei}, transaction cost: {simulated_transaction_cost}')
-        if transaction_cost_bps > self.arb_config['max_transaction_cost_bps']:
-            logger.info(f"Transaction cost (bps): {transaction_cost_bps} above threshold: {self.arb_config['max_transaction_cost_bps']}")
-            return False
-        
         return True
         
     
@@ -222,7 +154,6 @@ class ArbitrageStrategy:
         Monitor prices on Binance and Uniswap and detect arbitrage opportunities.
         """
         await self.binance.init()
-        await self.token_monitor.start_monitoring()
 
         while True:
             binance_price = self.binance.get_current_price(self.base_token)
@@ -234,13 +165,6 @@ class ArbitrageStrategy:
 
             await asyncio.sleep(1)  # Adjust the frequency as needed
 
-    async def close(self):
-        """
-        Close connections to Binance and Uniswap.
-        """
-        await self.binance.close()
-        await self.uniswap.stop_background_updates()
-        await self.token_monitor.stop_monitoring()
 
 # Example usage
 async def main():

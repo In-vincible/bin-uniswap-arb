@@ -1,5 +1,5 @@
 import abc
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 class BaseExchange(abc.ABC):
     """
@@ -15,6 +15,12 @@ class BaseExchange(abc.ABC):
         Initialize the exchange connector with configuration.
         """
         pass
+
+    async def init(self):
+        """
+        Initialize the exchange connector.
+        """
+        raise NotImplementedError()
         
     @abc.abstractmethod
     async def execute_trade(self, direction: str, size: float) -> Dict[str, Any]:
@@ -65,6 +71,12 @@ class BaseExchange(abc.ABC):
         """
         raise NotImplementedError()
     
+    async def get_base_asset_deposit_address(self) -> str:
+        """
+        Get the deposit address for the base asset.
+        """
+        raise NotImplementedError()
+    
     @abc.abstractmethod
     async def get_balance(self, instrument: str) -> float:
         """
@@ -78,6 +90,13 @@ class BaseExchange(abc.ABC):
             
         Raises:
             Exception: If balance retrieval fails
+        """
+        raise NotImplementedError()
+    
+    @abc.abstractmethod
+    async def get_base_asset_balance(self) -> float:
+        """
+        Get the current balance of the base asset.
         """
         raise NotImplementedError()
     
@@ -137,3 +156,84 @@ class BaseExchange(abc.ABC):
             float: The current price of the asset
         """
         raise NotImplementedError()
+    
+    @abc.abstractmethod
+    async def get_base_asset_price(self) -> float:
+        """
+        Get the current price of the base asset.
+        """
+        raise NotImplementedError()
+    
+    @abc.abstractmethod
+    async def pre_validate_transfers(self, asset: str, amount: float, max_transfer_time_seconds: int = 10) -> bool:
+        """
+        Pre-validate transfers for a specific asset, verify if network is healthy and if the asset is supported by the pool.
+
+        Args:
+            asset: The asset code (e.g., 'ETH')
+            max_transfer_time_seconds: The maximum transfer time in seconds
+
+        Returns:
+            bool: True if the transfer is valid, False otherwise
+        """
+        raise NotImplementedError()
+    
+    @abc.abstractmethod
+    async def compute_buy_and_transfer_costs(self, asset: str, amount: float) -> float:
+        """
+        Compute the execution costs in BPS for a specific asset.
+
+        Args:
+            asset: The asset code (e.g., 'ETH')
+            amount: The amount of the buy order
+        Returns:
+            float: The execution costs in BPS
+        """
+        raise NotImplementedError()
+    
+    @abc.abstractmethod
+    async def compute_sell_costs(self, asset: str, amount: float) -> float:
+        """
+        Compute the execution costs in BPS for a sell order.
+
+        Args:
+            asset: The asset code (e.g., 'ETH')
+            amount: The amount of the sell order
+
+        Returns:
+            float: The execution costs in BPS
+        """
+        raise NotImplementedError()
+    
+    @abc.abstractmethod
+    async def get_max_executible_size(self, asset: str, direction: str) -> float:
+        """
+        Get the maximum size that can be executed for a specific asset and direction.
+
+        Args:
+            asset: The asset code (e.g., 'ETH')
+            direction: The direction of the trade ('buy' or 'sell')
+
+        Returns:
+            float: The maximum size that can be executed
+        """
+        raise NotImplementedError()
+    
+    @abc.abstractmethod
+    async def wrap_asset(self, asset: str, amount: float) -> float:
+        """
+        Perform a block wrap for a specific assets.
+
+        Required for some exchanges to wrap the asset before sending it to the pool. for eg. ETH to WETH.
+        """
+        raise NotImplementedError()
+    
+    @abc.abstractmethod
+    async def unwrap_asset(self, asset: str, amount: float) -> float:
+        """
+        Perform a block unwrap for a specific assets.
+
+        Required for some exchanges to unwrap the asset for transfer. for eg. WETH to ETH.
+        """
+        raise NotImplementedError()
+    
