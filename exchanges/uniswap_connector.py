@@ -9,7 +9,8 @@ import asyncio
 import traceback
 
 from config import Config
-from .base_connector import BaseExchange
+from exchanges.base_connector import BaseExchange
+from token_monitoring import TokenMonitor
 
 logging.basicConfig(
     level=logging.INFO,
@@ -18,6 +19,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("uniswap_pool_monitor")
 TICK_BASE = Decimal(1.0001)
+
+class Token:
+    def __init__(self, address: str, symbol: str, decimals: int):
+        self.address = address
+        self.symbol = symbol
+        self.decimals = decimals
 
 class Uniswap(BaseExchange):
     """
@@ -64,23 +71,34 @@ class Uniswap(BaseExchange):
         Note:
             Metadata is loaded synchronously during initialization.
         """
-        self.w3 = Web3(Web3.HTTPProvider(infura_url))
+        self.infura_url = infura_url
         self.async_w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(infura_url))
         self.ws_url = infura_ws_url
         self.w3_ws = None # async web3
         self.pool_address = Web3.to_checksum_address(pool_address)
-        
-        self.pool_contract = self.w3.eth.contract(address=self.pool_address, abi=self.POOL_ABI)
         self.wallet_private_key = private_key
-        self.account = self.w3.eth.account.from_key(private_key)
-        self.metadata = self.load_metadata()
+        self.account = self.async_w3.eth.account.from_key(self.wallet_private_key)
+        
+        self.pool_contract = self.async_w3.eth.contract(address=self.pool_address, abi=self.POOL_ABI)
         self.liquidity = None
         self.sqrt_price = None
         self.tick = None
         self.balances = {}
         self.balance_update_interval = balance_update_interval
     
-    def load_metadata(self):
+    async def init(self):
+        """
+        Initialize the Uniswap connector.
+        """
+        self.metadata = await self.load_metadata()
+        self.token_monitor = TokenMonitor(
+            token_addresses=[self.metadata['token0'].address, self.metadata['token1'].address],
+            infura_url=self.infura_url,
+            v3_pool_addresses=[self.pool_address]
+        )
+        await self.start_event_listener()
+    
+    async def load_metadata(self):
         """
         Fetch and log metadata about the Uniswap pool and its tokens.
         
@@ -94,10 +112,10 @@ class Uniswap(BaseExchange):
             dict: A dictionary containing all the pool and token metadata
         """
         # Pool metadata
-        fee_tier = self.pool_contract.functions.fee().call()
-        tick_spacing = self.pool_contract.functions.tickSpacing().call()
-        token0_address = self.pool_contract.functions.token0().call()
-        token1_address = self.pool_contract.functions.token1().call()
+        fee_tier = await self.pool_contract.functions.fee().call()
+        tick_spacing = await self.pool_contract.functions.tickSpacing().call()
+        token0_address = await self.pool_contract.functions.token0().call()
+        token1_address = await self.pool_contract.functions.token1().call()
         self.burn_topic = self.pool_contract.events.Burn.build_filter().topics[0]
         self.mint_topic = self.pool_contract.events.Mint.build_filter().topics[0]
         self.swap_topic = self.pool_contract.events.Swap.build_filter().topics[0]
@@ -108,13 +126,13 @@ class Uniswap(BaseExchange):
         logger.info(f'Tick Spacing: {tick_spacing}')
 
         # Token metadata
-        token0_contract = self.w3.eth.contract(address=token0_address, abi=self.ERC20_ABI)
-        token1_contract = self.w3.eth.contract(address=token1_address, abi=self.ERC20_ABI)
+        token0_contract = self.async_w3.eth.contract(address=token0_address, abi=self.ERC20_ABI)
+        token1_contract = self.async_w3.eth.contract(address=token1_address, abi=self.ERC20_ABI)
         
-        token0_symbol = token0_contract.functions.symbol().call()
-        token0_decimals = token0_contract.functions.decimals().call()
-        token1_symbol = token1_contract.functions.symbol().call()
-        token1_decimals = token1_contract.functions.decimals().call()
+        token0_symbol = await token0_contract.functions.symbol().call()
+        token0_decimals = await token0_contract.functions.decimals().call()
+        token1_symbol = await token1_contract.functions.symbol().call()
+        token1_decimals = await token1_contract.functions.decimals().call()
         
         logger.info(f'Token0 Symbol: {token0_symbol}')
         logger.info(f'Token0 Decimals: {token0_decimals}')
@@ -124,16 +142,8 @@ class Uniswap(BaseExchange):
         metadata = {
             "fee_tier": fee_tier,
             "tick_spacing": tick_spacing,
-            "token0": {
-                "address": token0_address,
-                "symbol": token0_symbol,
-                "decimals": token0_decimals
-            },
-            "token1": {
-                "address": token1_address,
-                "symbol": token1_symbol,
-                "decimals": token1_decimals
-            }
+            "token0": Token(token0_address, token0_symbol, token0_decimals),
+            "token1": Token(token1_address, token1_symbol, token1_decimals)
         }
         return metadata
     
@@ -151,9 +161,9 @@ class Uniswap(BaseExchange):
         Update the balance cache.
         """
         for symbol_info in [self.metadata['token0'], self.metadata['token1']]:
-            contract = self.async_w3.eth.contract(address=symbol_info['address'], abi=self.ERC20_ABI)
-            symbol = symbol_info['symbol']
-            decimals = symbol_info['decimals']
+            contract = self.async_w3.eth.contract(address=symbol_info.address, abi=self.ERC20_ABI)
+            symbol = symbol_info.symbol
+            decimals = symbol_info.decimals
             balance = await contract.functions.balanceOf(self.account.address).call()
             symbol_balance = balance / (10 ** decimals)
             self.balances[symbol.lower()] = symbol_balance
@@ -295,8 +305,8 @@ class Uniswap(BaseExchange):
         
         # Apply token decimal adjustments
         # These conversions depend on the specific token's decimal places
-        token0_amount = token0_amount / Decimal(10**self.metadata['token0']['decimals'])
-        token1_amount = token1_amount / Decimal(10**self.metadata['token1']['decimals'])
+        token0_amount = token0_amount / Decimal(10**self.metadata['token0'].decimals)
+        token1_amount = token1_amount / Decimal(10**self.metadata['token1'].decimals)
         
         return token0_amount, token1_amount
     
@@ -343,8 +353,8 @@ class Uniswap(BaseExchange):
         token0_out_max = liquidity * (sqrt_price_current - sqrt_price_prev) / (sqrt_price_current * sqrt_price_prev)
         
         # Apply token decimal adjustments
-        token0_out_max = token0_out_max / Decimal(10**self.metadata['token0']['decimals'])
-        token1_in_max = token1_in_max / Decimal(10**self.metadata['token1']['decimals'])
+        token0_out_max = token0_out_max / Decimal(10**self.metadata['token0'].decimals)
+        token1_in_max = token1_in_max / Decimal(10**self.metadata['token1'].decimals)
         
         # Ensure we don't return negative values due to calculation precision errors
         token0_out_max = max(Decimal(0), token0_out_max)
@@ -362,6 +372,8 @@ class Uniswap(BaseExchange):
         if sqrt_price_x96 is None:
             sqrt_price_x96 = self.sqrt_price
 
+        if sqrt_price_x96 is None:
+            return None, None
         # Convert sqrtPriceX96 to Decimal and scale it down from X96 format
         scale_factor = Decimal(2) ** 96
         sqrt_price_x96 = Decimal(sqrt_price_x96) / scale_factor
@@ -373,7 +385,7 @@ class Uniswap(BaseExchange):
         price_token1_in_token0 = 1 / price_token0_in_token1 if price_token0_in_token1 != 0 else 0
 
         # Adjust for decimal differences
-        decimal_adjustment = Decimal(10**self.metadata['token1']['decimals']) / Decimal(10**self.metadata['token0']['decimals'])
+        decimal_adjustment = Decimal(10**self.metadata['token1'].decimals) / Decimal(10**self.metadata['token0'].decimals)
         price_token0_in_token1 = price_token0_in_token1 / decimal_adjustment
         price_token1_in_token0 = price_token1_in_token0 * decimal_adjustment
         
@@ -433,8 +445,8 @@ class Uniswap(BaseExchange):
                 reserve1 = liquidity * (sqrt_price_b - sqrt_price_a)
             
             # Convert to human-readable format with proper decimals
-            reserve0 = reserve0 / (10 ** self.metadata['token0']['decimals'])
-            reserve1 = reserve1 / (10 ** self.metadata['token1']['decimals'])
+            reserve0 = reserve0 / (10 ** self.metadata['token0'].decimals)
+            reserve1 = reserve1 / (10 ** self.metadata['token1'].decimals)
 
             return reserve0, reserve1
         
@@ -520,22 +532,22 @@ class Uniswap(BaseExchange):
         downward_price_impact = (1 - (downward_effective_price / current_market_price)) * 10_000 if downward_effective_price > 0 else 0
         
         # Log with more intuitive naming and include price impacts
-        logger.info(f"Current market price: 1 {self.metadata['token1']['symbol']} = {current_market_price:.4f} {self.metadata['token0']['symbol']}")
+        logger.info(f"Current market price: 1 {self.metadata['token1'].symbol} = {current_market_price:.4f} {self.metadata['token0'].symbol}")
         
-        logger.info(f"Upward swap (Buy {self.metadata['token1']['symbol']}): "
-                   f"{self.metadata['token0']['symbol']} in max: {token0_in_max:.6f}, "
-                   f"{self.metadata['token1']['symbol']} out max: {token1_out_max:.6f}, "
+        logger.info(f"Upward swap (Buy {self.metadata['token1'].symbol}): "
+                   f"{self.metadata['token0'].symbol} in max: {token0_in_max:.6f}, "
+                   f"{self.metadata['token1'].symbol} out max: {token1_out_max:.6f}, "
                    f"Effective price: {upward_effective_price:.4f} "
                    f"(Price impact: {upward_price_impact:.2f} bps)")
                    
-        logger.info(f"Downward swap (Sell {self.metadata['token1']['symbol']}): "
-                   f"{self.metadata['token1']['symbol']} in max: {token1_in_max:.6f}, "
-                   f"{self.metadata['token0']['symbol']} out max: {token0_out_max:.6f}, "
+        logger.info(f"Downward swap (Sell {self.metadata['token1'].symbol}): "
+                   f"{self.metadata['token1'].symbol} in max: {token1_in_max:.6f}, "
+                   f"{self.metadata['token0'].symbol} out max: {token0_out_max:.6f}, "
                    f"Effective price: {downward_effective_price:.4f} "
                    f"(Price impact: {downward_price_impact:.2f} bps)")
                    
-        logger.info(f"Reserves - {self.metadata['token0']['symbol']}: {reserve0:.2f}, "
-                   f"{self.metadata['token1']['symbol']}: {reserve1:.2f}")
+        logger.info(f"Reserves - {self.metadata['token0'].symbol}: {reserve0:.2f}, "
+                   f"{self.metadata['token1'].symbol}: {reserve1:.2f}")
 
     async def process_event(self, event):
         """
@@ -602,6 +614,7 @@ class Uniswap(BaseExchange):
         """
         asyncio.create_task(self._balance_update_loop())
         asyncio.create_task(self.start_listening_chain_events())
+        await self.token_monitor.start_monitoring()
     
     async def get_deposit_address(self, instrument: str) -> str:
         """
@@ -620,9 +633,9 @@ class Uniswap(BaseExchange):
         Get the current price of an asset.
         """
         token0_price, token1_price = self.compute_price_from_sqrt_price_x96()
-        if asset == self.metadata['token0']['symbol']:
+        if asset == self.metadata['token0'].symbol:
             return token0_price
-        elif asset == self.metadata['token1']['symbol']:
+        elif asset == self.metadata['token1'].symbol:
             return token1_price
         else:
             raise ValueError(f"Unsupported asset: {asset}")
@@ -631,12 +644,12 @@ class Uniswap(BaseExchange):
         """
         Get the address of an asset.
         """
-        if asset == self.metadata['token0']['symbol']:
-            return self.metadata['token0']['address']
-        elif asset == self.metadata['token1']['symbol']:
-            return self.metadata['token1']['address']
+        if asset == self.metadata['token0'].symbol:
+            return self.metadata['token0'].address
+        elif asset == self.metadata['token1'].symbol:
+            return self.metadata['token1'].address
         elif asset == 'ETH':
-            return self.async_w3.to_checksum_address("0x3e6b04c2f793d77d6414075aae1d44ef474b483e")
+            return self.async_w3.to_checksum_address(self.token_monitor.ETH_ADDRESS)
         else:
             raise ValueError(f"Unsupported asset: {asset}")
     
@@ -644,10 +657,10 @@ class Uniswap(BaseExchange):
         """
         Get the decimals of an asset.
         """
-        if asset == self.metadata['token0']['symbol']:
-            return self.metadata['token0']['decimals']
-        elif asset == self.metadata['token1']['symbol']:
-            return self.metadata['token1']['decimals']
+        if asset == self.metadata['token0'].symbol:
+            return self.metadata['token0'].decimals
+        elif asset == self.metadata['token1'].symbol:
+            return self.metadata['token1'].decimals
         elif asset == 'ETH':
             return 18
         else:
@@ -677,45 +690,65 @@ class Uniswap(BaseExchange):
         try:
             # Validate address
             to_address = self.async_w3.to_checksum_address(address)
-            token_address = self.get_asset_address(asset)
-            contract = self.async_w3.eth.contract(
-                address=token_address, 
-                abi=self.ERC20_ABI
-            )
             token_decimals = self.get_asset_decimals(asset)
             amount_wei = int(amount * (10 ** token_decimals))
             
-            # Check balance
+            # Handle ETH and token transfers differently
             if asset == 'ETH':
+                # Check ETH balance
                 balance = await self.async_w3.eth.get_balance(self.account.address)
+                if balance < amount_wei:
+                    raise ValueError(f"Insufficient ETH balance: {balance / 10**18} ETH")
+                
+                # For ETH transfers, we directly create a transaction with value
+                nonce = await self.async_w3.eth.get_transaction_count(self.account.address)
+                gas_price = await self.async_w3.eth.gas_price
+                
+                # Create the transaction
+                tx = {
+                    'nonce': nonce,
+                    'to': to_address,
+                    'value': amount_wei,  # This is the ETH amount in wei
+                    'gas': 21000,  # Standard gas limit for ETH transfers
+                    'gasPrice': gas_price,
+                    'chainId': await self.async_w3.eth.chain_id,
+                }
+                
+                logger.info(f"ETH transfer: amount_wei={amount_wei}, tx={tx}")
             else:
+                # For tokens, get the token contract
+                token_address = self.get_asset_address(asset)
+                contract = self.async_w3.eth.contract(
+                    address=token_address, 
+                    abi=self.ERC20_ABI
+                )
+                
+                # Check token balance
                 balance = await contract.functions.balanceOf(self.account.address).call()
-            if balance < amount_wei:
-                raise ValueError(f"Insufficient {asset} balance {balance / (10 ** token_decimals)}")
+                if balance < amount_wei:
+                    raise ValueError(f"Insufficient {asset} balance {balance / (10 ** token_decimals)}")
 
-            # Build transaction
-            nonce = await self.async_w3.eth.get_transaction_count(self.account.address)
-            tx = await contract.functions.transfer(to_address, amount_wei).build_transaction({
-                'nonce': nonce,
-                'gas': await contract.functions.transfer(to_address, amount_wei).estimate_gas(),
-                'gasPrice': await self.async_w3.eth.gas_price,  # or web3.toWei('20', 'gwei')
-                'chainId': await self.async_w3.eth.chain_id,
-            })
+                # Build token transfer transaction
+                nonce = await self.async_w3.eth.get_transaction_count(self.account.address)
+                tx = await contract.functions.transfer(to_address, amount_wei).build_transaction({
+                    'nonce': nonce,
+                    'gas': await contract.functions.transfer(to_address, amount_wei).estimate_gas(),
+                    'gasPrice': await self.async_w3.eth.gas_price,
+                    'chainId': await self.async_w3.eth.chain_id,
+                })
+                
+                logger.info(f"Token transfer: amount_wei={amount_wei}, tx={tx}")
 
+            # Sign and send the transaction (same for both ETH and tokens)
             signed_tx = self.async_w3.eth.account.sign_transaction(tx, self.wallet_private_key)
-            while True:
-                tx_hash = await self.async_w3.eth.send_raw_transaction(signed_tx.raw_transaction)
-                tx_hash = self.async_w3.to_hex(tx_hash)
-                if tx_hash:
-                    break
-                else:
-                    logger.info("Transaction failed, retrying...")
-                    await asyncio.sleep(1)
+            tx_hash = await self.async_w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            tx_hash = self.async_w3.to_hex(tx_hash)
 
             return {
                 'status': 'success',
                 'tx_hash': tx_hash,
-                'amount': amount
+                'amount': amount,
+                'asset': asset
             }
         except Exception as e:
             logger.error(f"Withdrawal failed: {str(e)}")
@@ -723,22 +756,32 @@ class Uniswap(BaseExchange):
             return {
                 'status': 'error',
                 'error': str(e),
-                'amount': 0
+                'amount': 0,
+                'asset': asset
             }
         
     async def confirm_withdrawal(self, withdrawal_info: Dict[str, Any]) -> float:
         """
         Confirm that a withdrawal was completed and return the confirmed size.
+        
+        WHY: Verifies both transaction success and amount to ensure the withdrawal
+        completed as expected before reporting back to the caller.
         """
         if withdrawal_info['status'] == 'error':
             return 0
-        else:
-            tx_receipt = await self.async_w3.eth.wait_for_transaction_receipt(withdrawal_info['tx_hash'])
-            logger.info(f"Transaction receipt: {tx_receipt}")
-            if tx_receipt and 'status' in tx_receipt:
-                return withdrawal_info['amount']
-            else:
-                return 0
+        
+        tx_receipt = await self.async_w3.eth.wait_for_transaction_receipt(withdrawal_info['tx_hash'])
+        logger.info(f"Transaction receipt: {tx_receipt}")
+        
+        if tx_receipt and tx_receipt.get('status') == 1:
+            # Verify the transaction amount from the transaction data
+            tx = await self.async_w3.eth.get_transaction(withdrawal_info['tx_hash'])
+            logger.info(f"Transaction: {tx}")
+            decimals = self.get_asset_decimals(withdrawal_info['asset'])
+            confirmed_amount = tx['value'] / 10**decimals
+            return confirmed_amount
+        
+        return 0
     
     async def confirm_deposit(self, asset: str, amount: float, tolerance: float = 1e-6) -> float:
         """
@@ -776,6 +819,37 @@ class Uniswap(BaseExchange):
         logger.info(f"Executing {trade_direction} trade of {trade_size}")
         return trade_size
     
+    async def pre_validate_transfers(self, asset: str, amount: float, max_transfer_time_seconds: int = 10) -> bool:
+        """
+        Check if network is healthy and if the asset is supported by the pool.
+        """
+        network_check = self.token_monitor.check_network_conditions()
+        if network_check['status'] != 'ok':
+            logger.warning(f"Network is not healthy, transfer may fail")
+            return False
+        
+        transfer_status = self.token_monitor.estimate_transfer_time()
+        if transfer_status['is_congested']:
+            logger.warning(f"Network is congested, transfer may fail")
+            return False
+        
+        if transfer_status['estimate_seconds'] > max_transfer_time_seconds:
+            logger.warning(f"Transfer may take too long, consider increasing max_transfer_time_seconds")
+            return False
+        
+        return True
+    
+    async def compute_buy_and_transfer_costs(self, asset: str, amount: float) -> float:
+        """
+        Compute the buy and transfer costs for a specific asset.
+        """
+        return 0
+    
+    async def compute_sell_costs(self, asset: str, amount: float) -> float:
+        """
+        Compute the sell costs for a specific asset.
+        """
+        return 0
 
 async def main():
     """
@@ -789,13 +863,11 @@ async def main():
         pool_address = config.instrument_config[0]['pool_address']  
         private_key = config.wallet_private_key
         
-        # Create monitor - metadata is loaded synchronously in __init__
+        # Initialize the connector
         uniswap = Uniswap(infura_url, infura_ws_url, pool_address, private_key)
-        logger.info(f"Pool contains {uniswap.metadata['token0']['symbol']} and {uniswap.metadata['token1']['symbol']}")
+        await uniswap.init()
+        logger.info(f"Pool contains {uniswap.metadata['token0'].symbol} and {uniswap.metadata['token1'].symbol}")
         
-        # Start the event listener
-        await uniswap.start_event_listener()
-
         # Test withdraw
         deposit_address = "0x3e6b04c2f793d77d6414075aae1d44ef474b483e"
         withdrawal_info = await uniswap.withdraw(asset="ETH", address=deposit_address, amount=0.002)

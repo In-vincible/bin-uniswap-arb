@@ -5,7 +5,7 @@ import traceback
 from typing import Any, Dict
 from binance import AsyncClient, BinanceSocketManager
 from config import Config
-from .base_connector import BaseExchange
+from exchanges.base_connector import BaseExchange
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,6 +31,7 @@ class Binance(BaseExchange):
         self.min_withdrawal_amount = {}
         self.balance_update_interval = balance_update_interval
         self.deposit_withdraw_check_interval = deposit_withdraw_check_interval
+        self.taker_fee_bps = 10
 
     async def init(self):
         """
@@ -91,8 +92,8 @@ class Binance(BaseExchange):
             asset_status = await self.get_asset_status(asset)
             self.deposit_status[asset] = asset_status.get('depositStatus', False)
             self.withdrawal_status[asset] = asset_status.get('withdrawStatus', False)
-            self.withdrawal_fee[asset] = asset_status.get('withdrawFee', 0)
-            self.min_withdrawal_amount[asset] = asset_status.get('minWithdrawAmount', 0)
+            self.withdrawal_fee[asset] = float(asset_status.get('withdrawFee', 0))
+            self.min_withdrawal_amount[asset] = float(asset_status.get('minWithdrawAmount', 0))
     
     def subscribe_market_data(self, callback=None):
         """
@@ -146,7 +147,7 @@ class Binance(BaseExchange):
             return self.market_data[symbol]
         return None
     
-    def get_current_price(self, asset: str):
+    async def get_current_price(self, asset: str):
         """
         Get the current price of an asset.
         
@@ -356,8 +357,8 @@ class Binance(BaseExchange):
         """
         deposit_history = await self.get_deposit_history(asset)
         for deposit in deposit_history:
-            if abs(deposit['amount'] - amount) <= tolerance:
-                return deposit['amount']
+            if abs(float(deposit['amount']) - amount) <= tolerance:
+                return float(deposit['amount'])
         return 0
     
     async def confirm_withdrawal(self, withdrawal_info: Dict[str, Any]):
@@ -372,6 +373,59 @@ class Binance(BaseExchange):
             elif withdrawal['status'] == 3:
                 return 0
             await asyncio.sleep(0.5)
+    
+    async def pre_validate_transfers(self, asset: str, amount: float, max_transfer_time_seconds: int = 10) -> bool:
+        """
+        Pre-validate transfers for a specific asset, verify if network is healthy and if the asset is supported by the pool.
+        """
+        if not await self.verify_deposit_open(asset):
+            logger.warning(f"Deposit is not open for {asset}")
+            return False
+        
+        if not await self.verify_withdrawal_open(asset):
+            logger.warning(f"Withdrawal is not open for {asset}")
+            return False
+        
+        if amount < self.min_withdrawal_amount[asset]:
+            logger.warning(f"Amount ({amount}) is less than the minimum withdrawal ({self.min_withdrawal_amount[asset]}) amount for {asset}")
+            return False
+        
+        return True
+    
+    async def compute_buy_and_transfer_costs(self, asset: str, amount: float) -> float:
+        """
+        Compute the buy and transfer costs for a specific asset.
+
+        Args:
+            asset: The asset code (e.g., 'ETH')
+
+        Returns:
+            float: The execution costs in BPS
+        """
+        # First calculate how much we'll receive after paying taker fee
+        post_execution_amount = amount * (1 - (self.taker_fee_bps / 10000))  # Convert bps to decimal
+        
+        # Then calculate how much we'll have after withdrawal fee
+        withdrawal_fee = await self.get_withdrawal_fee(asset)
+        final_amount = post_execution_amount - withdrawal_fee
+        
+        # Return total cost in bps
+        total_cost_bps = (1 - final_amount / amount) * 10000
+        return total_cost_bps
+    
+    async def compute_sell_costs(self, asset: str, amount: float) -> float:
+        """
+        Compute execution costs in BPS for a sell order.
+
+        Args:
+            asset: The asset code (e.g., 'ETH')
+            amount: The amount of the sell order
+
+        Returns:
+            float: The execution costs in BPS
+        """
+        return self.taker_fee_bps
+        
 
 # --- Async test code in __main__ ---
 async def main():
@@ -467,7 +521,43 @@ async def main():
         logger.info(f"Confirmed withdrawal: {confirmed_withdrawal}")
     except Exception as e:
         logger.info(f"Error confirming withdrawal: {e}")
+    
+    # Example: Confirm deposit
+    try:
+        deposit_asset = "ETH"
+        deposit_amount = 0.002
+        confirmed_deposit = await connector.confirm_deposit(deposit_asset, deposit_amount)
+        logger.info(f"Confirmed deposit: {confirmed_deposit}")
+    except Exception as e:
+        logger.info(f"Error confirming deposit: {e}")
+    
+    # Example: Pre-validate transfers
+    try:
+        pre_validate = await connector.pre_validate_transfers("ETH", 0.001)
+        logger.info(f"Pre-validate transfers: {pre_validate}")
+    except Exception as e:
+        logger.info(f"Error pre-validating transfers: {e}")
+    
+    # Fetch withdrawal fee
+    try:
+        withdrawal_fee = await connector.get_withdrawal_fee("ETH")
+        logger.info(f"Withdrawal fee: {withdrawal_fee}")
+    except Exception as e:
+        logger.info(f"Error fetching withdrawal fee: {e}")
         
+    # Compute buy and transfer costs
+    try:
+        buy_and_transfer_costs = await connector.compute_buy_and_transfer_costs("ETH", 0.01)
+        logger.info(f"Buy and transfer costs: {round(buy_and_transfer_costs, 2)} BPS")
+    except Exception as e:
+        logger.info(f"Error computing buy and transfer costs: {e}")
+    
+    # Compute sell costs
+    try:
+        sell_costs = await connector.compute_sell_costs("ETH", 0.01)
+        logger.info(f"Sell costs: {round(sell_costs, 2)} BPS")
+    except Exception as e:
+        logger.info(f"Error computing sell costs: {e}")
         
     # Get updated prices
     while True:
