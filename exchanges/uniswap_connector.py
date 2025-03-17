@@ -7,6 +7,7 @@ from web3.providers.persistent import WebSocketProvider
 from web3.utils.subscriptions import LogsSubscription
 import logging
 import asyncio
+import secrets
 import traceback
 
 from config import Config
@@ -46,6 +47,11 @@ class Uniswap(BaseExchange):
         {"constant": True, "inputs": [], "name": "token1", "outputs": [{"internalType": "address", "name": "", "type": "address"}], "type": "function"},
         {"constant": True, "inputs": [], "name": "fee", "outputs": [{"internalType": "uint24", "name": "", "type": "uint24"}], "type": "function"},
         {"inputs":[],"name":"tickSpacing","outputs":[{"internalType":"int24","name":"","type":"int24"}],"stateMutability":"view","type":"function"},
+        
+        # Slot0, liquidity (To initiate tick/liquidity/sqrtPriceX96 before we start receiving events)
+        {"inputs":[],"name":"slot0","outputs":[{"internalType":"uint160","name":"sqrtPriceX96","type":"uint160"},{"internalType":"int24","name":"tick","type":"int24"},{"internalType":"uint16","name":"observationIndex","type":"uint16"},{"internalType":"uint16","name":"observationCardinality","type":"uint16"},{"internalType":"uint16","name":"observationCardinalityNext","type":"uint16"},{"internalType":"uint8","name":"feeProtocol","type":"uint8"},{"internalType":"bool","name":"unlocked","type":"bool"}],"stateMutability":"view","type":"function"},
+        {"inputs":[],"name":"liquidity","outputs":[{"internalType":"uint128","name":"","type":"uint128"}],"stateMutability":"view","type":"function"},
+
         # Events
         {"anonymous":False,"inputs":[{"indexed":True,"internalType":"address","name":"owner","type":"address"},{"indexed":True,"internalType":"int24","name":"tickLower","type":"int24"},{"indexed":True,"internalType":"int24","name":"tickUpper","type":"int24"},{"indexed":False,"internalType":"uint128","name":"amount","type":"uint128"},{"indexed":False,"internalType":"uint256","name":"amount0","type":"uint256"},{"indexed":False,"internalType":"uint256","name":"amount1","type":"uint256"}],"name":"Burn","type":"event"},
         {"anonymous":False,"inputs":[{"indexed":True,"internalType":"address","name":"owner","type":"address"},{"indexed":True,"internalType":"int24","name":"tickLower","type":"int24"},{"indexed":True,"internalType":"int24","name":"tickUpper","type":"int24"},{"indexed":False,"internalType":"uint128","name":"amount","type":"uint128"},{"indexed":False,"internalType":"uint256","name":"amount0","type":"uint256"},{"indexed":False,"internalType":"uint256","name":"amount1","type":"uint256"}],"name":"Mint","type":"event"},
@@ -55,13 +61,25 @@ class Uniswap(BaseExchange):
 
     # ERC20 Token ABI (Minimal)
     ERC20_ABI = [
+        # symbol, decimals, balance
         {"constant": True, "inputs": [], "name": "symbol", "outputs": [{"name": "", "type": "string"}], "payable": False, "stateMutability": "view", "type": "function"},
         {"constant": True, "inputs": [], "name": "decimals", "outputs": [{"name": "", "type": "uint8"}], "payable": False, "stateMutability": "view", "type": "function"},
         {"constant": True, "inputs": [{"name": "_owner", "type": "address"}], "name": "balanceOf", "outputs": [{"name": "balance", "type": "uint256"}], "payable": False, "stateMutability": "view", "type": "function"},
+        
+        # Deposit/Withdrawal/Wrap/Unwrap
         {"constant": False, "inputs": [{"name": "_to", "type": "address"}, {"name": "_value", "type": "uint256"}], "name": "transfer", "outputs": [{"name": "success", "type": "bool"}], "payable": False, "stateMutability": "nonpayable", "type": "function"},
+        {"constant": False, "inputs": [], "name": "deposit", "outputs": [], "payable": True, "stateMutability": "payable", "type": "function"},
+        {"constant": False, "inputs": [{"name": "wad", "type": "uint256"}], "name": "withdraw", "outputs": [], "payable": False, "stateMutability": "nonpayable", "type": "function"},
+
+        # Swap Router ABI
+        {"constant": True, "inputs": [{"name": "_owner", "type": "address"}, {"name": "_spender", "type": "address"}], "name": "allowance", "outputs": [{"name": "remaining", "type": "uint256"}], "payable": False, "stateMutability": "view", "type": "function"},
+        {"constant": False, "inputs": [{"name": "_spender", "type": "address"}, {"name": "_value", "type": "uint256"}], "name": "approve", "outputs": [{"name": "success", "type": "bool"}], "payable": False, "stateMutability": "nonpayable", "type": "function"}
     ]
+
+    # Flashbots RPC endpoint
+    FLASHBOTS_RPC = "https://relay.flashbots.net"
     
-    def __init__(self, infura_url, infura_ws_url, pool_address, private_key, base_asset: str, quote_asset: str, balance_update_interval=15):
+    def __init__(self, infura_url, infura_ws_url, pool_address, private_key, base_asset: str, quote_asset: str, enable_flash_bot: bool, balance_update_interval=15):
         """
         Initialize the PoolMonitor with Ethereum connection and pool contract.
         
@@ -89,7 +107,10 @@ class Uniswap(BaseExchange):
         self.balance_update_interval = balance_update_interval
         self.base_asset = base_asset
         self.quote_asset = quote_asset
-    
+        self.enable_flash_bot = enable_flash_bot
+        self.searcher_key = None
+        self.flashbots_provider = None
+
     async def init(self):
         """
         Initialize the Uniswap connector.
@@ -120,6 +141,7 @@ class Uniswap(BaseExchange):
         tick_spacing = await self.pool_contract.functions.tickSpacing().call()
         token0_address = await self.pool_contract.functions.token0().call()
         token1_address = await self.pool_contract.functions.token1().call()
+        eth_address = self.async_w3.to_checksum_address("0x3e6b04c2f793d77d6414075aae1d44ef474b483e")
         self.burn_topic = self.pool_contract.events.Burn.build_filter().topics[0]
         self.mint_topic = self.pool_contract.events.Mint.build_filter().topics[0]
         self.swap_topic = self.pool_contract.events.Swap.build_filter().topics[0]
@@ -129,6 +151,12 @@ class Uniswap(BaseExchange):
         logger.info(f'Fee Tier: {fee_tier}')
         logger.info(f'Tick Spacing: {tick_spacing}')
 
+        # Initial tick/liquidity/sqrtPriceX96
+        slot0 = await self.pool_contract.functions.slot0().call()
+        self.tick = slot0[1]
+        self.liquidity = await self.pool_contract.functions.liquidity().call()
+        self.sqrt_price = slot0[0]
+
         # Token metadata
         token0_contract = self.async_w3.eth.contract(address=token0_address, abi=self.ERC20_ABI)
         token1_contract = self.async_w3.eth.contract(address=token1_address, abi=self.ERC20_ABI)
@@ -137,6 +165,8 @@ class Uniswap(BaseExchange):
         token0_decimals = await token0_contract.functions.decimals().call()
         token1_symbol = await token1_contract.functions.symbol().call()
         token1_decimals = await token1_contract.functions.decimals().call()
+        eth_symbol = "ETH"
+        eth_decimals = 18
         
         logger.info(f'Token0 Symbol: {token0_symbol}')
         logger.info(f'Token0 Decimals: {token0_decimals}')
@@ -147,7 +177,8 @@ class Uniswap(BaseExchange):
             "fee_tier": fee_tier,
             "tick_spacing": tick_spacing,
             "token0": Token(token0_address, token0_symbol, token0_decimals),
-            "token1": Token(token1_address, token1_symbol, token1_decimals)
+            "token1": Token(token1_address, token1_symbol, token1_decimals),
+            "ETH": Token(eth_address, eth_symbol, eth_decimals)
         }
         return metadata
     
@@ -155,10 +186,9 @@ class Uniswap(BaseExchange):
         """
         Get the balance of a token.
         """
-        if live:
-            return await self.update_balance_cache()
-        else:
-            return self.balances[symbol.lower()]
+        if live or len(self.balances) == 0:
+            await self.update_balance_cache()
+        return self.balances[symbol.lower()]
     
     async def update_balance_cache(self):
         """
@@ -171,6 +201,10 @@ class Uniswap(BaseExchange):
             balance = await contract.functions.balanceOf(self.account.address).call()
             symbol_balance = balance / (10 ** decimals)
             self.balances[symbol.lower()] = symbol_balance
+        
+        eth_balance = await self.async_w3.eth.get_balance(self.account.address)
+        self.balances['eth'] = eth_balance / (10 ** self.metadata['ETH'].decimals)
+        
         return self.balances
     
     async def _balance_update_loop(self):
@@ -626,11 +660,74 @@ class Uniswap(BaseExchange):
         """
         return self.account.address
     
-    async def confirm_trade(self, trade: Dict[str, Any]) -> float:
+    async def confirm_trade(self, tx_hash: str) -> float:
         """
-        Confirm that a trade was executed and return the confirmed size.
+        Confirm that a trade was executed and return the amount of output token received.
+        
+        Args:
+            tx_hash (str): Transaction hash to confirm
+            
+        Returns:
+            float: The amount of output tokens received, or 0 if the transaction failed
         """
-        return trade['size']
+        try:
+            # Get transaction receipt
+            tx_receipt = await self.async_w3.eth.wait_for_transaction_receipt(tx_hash, timeout=240)
+            logger.info(f"[Confirm trade] Tx receipt status: {tx_receipt.status}")
+            
+            if tx_receipt.status != 1:
+                logger.error(f"Transaction failed with status: {tx_receipt.status}")
+                return 0
+                
+            # Debug all logs to see what we're working with
+            logger.info(f"Transaction has {len(tx_receipt.logs)} log entries")
+            
+            # Get the user address in lowercase for comparison
+            user_address = self.account.address.lower()
+            
+            # Simply grab the first Transfer log that involves one of our tokens going to our address
+            for log in tx_receipt.logs:
+                # Find token transfers (these have 'address' field for token contract and 3 topics)
+                if hasattr(log, 'address') and hasattr(log, 'topics') and len(log.topics) == 3:
+                    # Get the token address and check if it's one of our pool tokens
+                    token_address = log.address.lower()
+                    token_info = None
+                    
+                    if token_address == self.metadata['token0'].address.lower():
+                        token_info = self.metadata['token0']
+                    elif token_address == self.metadata['token1'].address.lower():
+                        token_info = self.metadata['token1']
+                    else:
+                        continue  # Not a token we care about
+                    
+                    # The last topic should contain the recipient address
+                    # Convert the address bytes to a standard checksum address for comparison
+                    recipient_bytes = log.topics[2][-20:]  # Last 20 bytes of the topic
+                    recipient = self.async_w3.to_checksum_address('0x' + recipient_bytes.hex()).lower()
+                    
+                    # Check if we're the recipient
+                    if recipient == user_address:
+                        # Extract the amount from data field (this is the most reliable way)
+                        amount_wei = int(log.data.hex(), 16)
+                        amount = amount_wei / (10 ** token_info.decimals)
+                        
+                        logger.info(f"Found token transfer to user: {amount} {token_info.symbol}")
+                        return amount
+            
+            # If we get here, we couldn't find a relevant token transfer
+            # Let's try an alternative approach - check all logs
+            for i, log in enumerate(tx_receipt.logs):
+                logger.info(f"Log {i}: address={log.address}, topics={[t.hex() for t in log.topics]}")
+                if hasattr(log, 'data'):
+                    logger.info(f"  data={log.data.hex()}")
+            
+            logger.warning("No token transfers to user found in transaction logs")
+            return 0
+                
+        except Exception as e:
+            logger.error(f"Error confirming trade: {str(e)}")
+            logger.error(traceback.format_exc())
+            return 0
     
     async def get_current_price(self, asset: str) -> float:
         """
@@ -772,7 +869,7 @@ class Uniswap(BaseExchange):
         if withdrawal_info['status'] == 'error':
             return 0
         
-        tx_receipt = await self.async_w3.eth.wait_for_transaction_receipt(withdrawal_info['tx_hash'])
+        tx_receipt = await self.async_w3.eth.wait_for_transaction_receipt(withdrawal_info['tx_hash'], timeout=240)
         logger.info(f"Transaction receipt: {tx_receipt}")
         
         if tx_receipt and tx_receipt.get('status') == 1:
@@ -813,8 +910,158 @@ class Uniswap(BaseExchange):
             transfer_amount = event.args.value / (10 ** self.get_asset_decimals(asset))
             if abs(transfer_amount - amount) <= tolerance:
                 return transfer_amount
+
+    async def generate_searcher_key(self):
+        if self.searcher_key is None:
+            # Generate a new random account for signing flashbots bundles.
+            new_account = self.async_w3.eth.account.create(secrets.token_hex(32))
+            self.searcher_key = new_account.privateKey.hex()
+        return self.searcher_key
     
-    async def swap_instrument(self, amount: float, token_address: str, slippage: float = 0.05, deadline: int = 60) -> str:
+    def get_flashbots_provider(self):
+        """
+        Get the Flashbots provider.
+        """
+        # Currently can't be used to dependency conflicts with WebsocketProvider
+        from flashbots import flashbot
+        if self.flashbots_provider is None:
+            self.flashbots_provider = flashbot(self.async_w3, self.searcher_key, self.FLASHBOTS_RPC)
+        return self.flashbots_provider
+    
+    async def swap_via_flash_bot(self, amount: float, token_address: str, slippage: float = 0.1, deadline: int = 240) -> str:
+        """
+        Execute a swap transaction using Uniswap V3 FlashBot.
+        
+        This method uses Flashbots to execute a swap transaction on Uniswap V3, which helps
+        avoid frontrunning and provides better execution by bundling the transaction directly
+        with miners.
+        
+        Args:
+            amount (float): The amount of tokens to swap
+            token_address (str): The address of the token being swapped
+            slippage (float): Maximum allowed slippage in percentage (default: 0.1%)
+            deadline (int): Transaction deadline in seconds (default: 240)
+            
+        Returns:
+            str: Transaction hash if successful, None otherwise
+        """
+        try:
+            # Verify token is in pool
+            token0 = self.metadata['token0'].address
+            token1 = self.metadata['token1'].address
+            token_address = self.async_w3.to_checksum_address(token_address)
+            
+            if token_address not in [token0, token1]:
+                raise ValueError(f"Token address {token_address} must be one of the pool's tokens ({token0} or {token1})")
+            
+            # Determine which token is being swapped in/out
+            is_token0 = (token_address == token0)
+            token_in = token0 if is_token0 else token1
+            token_out = token1 if is_token0 else token0
+            token_in_symbol = self.metadata['token0'].symbol if is_token0 else self.metadata['token1'].symbol
+            token_out_symbol = self.metadata['token1'].symbol if is_token0 else self.metadata['token0'].symbol
+
+            # Get token contract and decimals
+            token_contract = self.async_w3.eth.contract(address=token_address, abi=self.ERC20_ABI)
+            decimals = self.get_asset_decimals(token_in_symbol)
+            
+            # Convert amount to wei
+            amount_wei = int(amount * (10 ** decimals))
+            
+            # Check token balance
+            token_balance = await token_contract.functions.balanceOf(self.account.address).call()
+            if token_balance < amount_wei:
+                logger.error(f"Insufficient token balance: {token_balance/(10**decimals)} < {amount}")
+                return None
+            
+            # Calculate minimum amount out based on slippage
+            current_price = await self.get_base_asset_price()
+            min_amount_out = int(amount * current_price * (1 - slippage/100) * (10 ** self.get_asset_decimals(token_out_symbol)))
+            
+            # Create swap parameters for Flashbots
+            swap_params = {
+                'tokenIn': token_in,
+                'tokenOut': token_out,
+                'fee': 3000,  # 0.3% fee tier
+                'recipient': self.account.address,
+                'deadline': int(time.time() + deadline),
+                'amountIn': amount_wei,
+                'amountOutMinimum': min_amount_out,
+                'sqrtPriceLimitX96': 0  # No price limit
+            }
+            
+            # Approve token spending if needed
+            allowance = await token_contract.functions.allowance(
+                self.account.address, 
+                self.UNISWAP_V3_ROUTER
+            ).call()
+            
+            if allowance < amount_wei:
+                logger.info(f"Approving {amount} {token_in_symbol} for Uniswap V3 Router")
+                approve_tx = await token_contract.functions.approve(
+                    self.UNISWAP_V3_ROUTER, 
+                    amount_wei
+                ).build_transaction({
+                    'from': self.account.address,
+                    'nonce': await self.async_w3.eth.get_transaction_count(self.account.address),
+                    'gas': 100000,
+                    'gasPrice': await self.async_w3.eth.gas_price
+                })
+                
+                signed_approve_tx = self.async_w3.eth.account.sign_transaction(approve_tx, self.private_key)
+                await self.async_w3.eth.send_raw_transaction(signed_approve_tx.rawTransaction)
+            
+            # Create and sign the swap transaction
+            router_contract = self.async_w3.eth.contract(
+                address=self.UNISWAP_V3_ROUTER,
+                abi=self.ROUTER_ABI
+            )
+            
+            swap_tx = await router_contract.functions.exactInputSingle(swap_params).build_transaction({
+                'from': self.account.address,
+                'nonce': await self.async_w3.eth.get_transaction_count(self.account.address),
+                'gas': 350000,
+                'gasPrice': 0  # Flashbots will set this
+            })
+            
+            # Sign the transaction
+            signed_swap_tx = self.async_w3.eth.account.sign_transaction(swap_tx, self.private_key)
+            
+            # Create Flashbots bundle
+            flashbots_provider = self.get_flashbots_provider()
+            
+            # Get current block
+            block = await self.async_w3.eth.block_number
+            
+            # Send bundle to Flashbots relay
+            bundle = [
+                {
+                    "signed_transaction": signed_swap_tx.rawTransaction.hex()
+                }
+            ]
+            
+            # Try to include the bundle in the next few blocks
+            for target_block in range(block + 1, block + 5):
+                response = await flashbots_provider.send_bundle(
+                    bundle,
+                    target_block_number=target_block
+                )
+                
+                # Wait for bundle to be included
+                inclusion = await response.wait()
+                if inclusion:
+                    logger.info(f"Flashbots bundle included in block {target_block}")
+                    return signed_swap_tx.hash.hex()
+            
+            logger.error("Flashbots bundle was not included after several blocks")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error in swap_via_flash_bot: {e}")
+            logger.error(traceback.format_exc())
+            return None
+    
+    async def swap_via_v3_router(self, amount: float, token_address: str, slippage: float = 0.1, deadline: int = 240) -> str:
         """
         Execute a swap transaction using Uniswap V3 SwapRouter.
         """
@@ -837,12 +1084,14 @@ class Uniswap(BaseExchange):
             is_token0 = (token_address == token0)
             token_in = token0 if is_token0 else token1
             token_out = token1 if is_token0 else token0
+            token_in_symbol = self.metadata['token0'].symbol if is_token0 else self.metadata['token1'].symbol
+            token_out_symbol = self.metadata['token1'].symbol if is_token0 else self.metadata['token0'].symbol
             
             logger.info(f"Token in: {token_in}, Token out: {token_out}, Is token0: {is_token0}")
             
             # Get token contract and decimals
-            token_contract = self.async_w3.eth.contract(address=token_address, abi=self.erc20_abi)
-            decimals = self.get_asset_decimals(token_in)
+            token_contract = self.async_w3.eth.contract(address=token_address, abi=self.ERC20_ABI)
+            decimals = self.get_asset_decimals(token_in_symbol)
             logger.info(f"Token decimals: {decimals}")
             
             # Check token balance
@@ -870,7 +1119,7 @@ class Uniswap(BaseExchange):
             )
             
             # Check if token approval is needed
-            allowance = token_contract.functions.allowance(
+            allowance = await token_contract.functions.allowance(
                 self.account.address, 
                 self.async_w3.to_checksum_address(UNISWAP_V3_ROUTER)
             ).call()
@@ -880,7 +1129,7 @@ class Uniswap(BaseExchange):
             if allowance < amount_wei:
                 logger.info(f"Approving router to spend {amount} tokens...")
                 # Need to approve the router to spend tokens
-                approve_tx = token_contract.functions.approve(
+                approve_tx = await token_contract.functions.approve(
                     self.async_w3.to_checksum_address(UNISWAP_V3_ROUTER),
                     amount_wei * 2  # Approve more than needed
                 ).build_transaction({
@@ -893,37 +1142,33 @@ class Uniswap(BaseExchange):
                 
                 # Sign and send approval transaction
                 signed_tx = self.async_w3.eth.account.sign_transaction(approve_tx, self.wallet_private_key)
-                approve_tx_hash = await self.async_w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+                approve_tx_hash = await self.async_w3.eth.send_raw_transaction(signed_tx.raw_transaction)
                 
                 # Wait for approval
                 logger.info(f"Waiting for approval transaction {approve_tx_hash.hex()} to be confirmed...")
-                tx_receipt = await self.async_w3.eth.wait_for_transaction_receipt(approve_tx_hash)
+                tx_receipt = await self.async_w3.eth.wait_for_transaction_receipt(approve_tx_hash, timeout=240)
                 logger.info(f"tx_receipt: {tx_receipt}")
             
             # Convert deadline from seconds to timestamp
             deadline_timestamp = int(time.time()) + deadline
             logger.info(f"Using deadline: {deadline_timestamp} (current time + {deadline} seconds)")
             
-            
-            
             # For WETH to USDC
             if not is_token0:  # WETH is token1
-                expected_output = amount_wei * await self.get_current_price(self.metadata['token1'].symbol) / (10**6)  # Convert to USDC decimals
+                expected_output = amount_wei * await self.get_current_price(self.metadata['token1'].symbol) 
             else:  # WETH is token0
-                expected_output = amount_wei * await self.get_current_price(self.metadata['token0'].symbol) / (10**6)
+                expected_output = amount_wei * await self.get_current_price(self.metadata['token0'].symbol)
                 
-            # Apply slippage - 50% more than requested for safety
-            real_slippage = slippage * 1.5
-            min_output = int(expected_output * (1 - real_slippage))
+            min_output = int(expected_output * (1 - slippage))
             
-            logger.info(f"Exact input swap: {amount} tokens in, expecting ~{expected_output/(10**6)} out")
-            logger.info(f"Min output with {real_slippage*100}% effective slippage: {min_output/(10**6)}")
+            logger.info(f"Exact input swap: {amount} tokens in, expecting ~{amount_wei/(10**self.get_asset_decimals(token_out_symbol))} out")
+            logger.info(f"Min output with {slippage*100}% effective slippage: {min_output/(10**self.get_asset_decimals(token_in_symbol))}")
             
             # Create transaction parameters
             params = (
                 token_in,                # tokenIn
                 token_out,               # tokenOut
-                self.fee_tier,           # fee
+                self.metadata['fee_tier'],           # fee
                 self.account.address,     # recipient
                 deadline_timestamp,      # deadline
                 amount_wei,              # amountIn
@@ -932,7 +1177,7 @@ class Uniswap(BaseExchange):
             )
             
             # Build transaction
-            tx = router_contract.functions.exactInputSingle(params).build_transaction({
+            tx = await router_contract.functions.exactInputSingle(params).build_transaction({
                 'from': self.account.address,
                 'nonce': await self.async_w3.eth.get_transaction_count(self.account.address),
                 'gas': 300000,  # Safe starting value
@@ -951,7 +1196,7 @@ class Uniswap(BaseExchange):
             
             # Sign and send transaction
             signed_tx = self.async_w3.eth.account.sign_transaction(tx, self.wallet_private_key)
-            tx_hash = await self.async_w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            tx_hash = await self.async_w3.eth.send_raw_transaction(signed_tx.raw_transaction)
             logger.info(f"Swap transaction submitted: {tx_hash.hex()}")
             
             return tx_hash.hex()
@@ -966,10 +1211,17 @@ class Uniswap(BaseExchange):
         Execute a trade.
         """
         token_in_address = self.get_asset_address(self.base_asset)
-        if trade_direction.upper() == "SELL":
+        amount_in = trade_size
+        if trade_direction.upper() == "BUY":
             token_in_address = self.get_asset_address(self.quote_asset)
+            current_balance = await self.get_balance(self.quote_asset)
+            amount_in = trade_size * await self.get_current_price(self.quote_asset)
+            amount_in = min(amount_in, current_balance)
 
-        return await self.swap_instrument(trade_size, token_in_address)
+        if self.enable_flash_bot:
+            return await self.swap_via_flash_bot(amount_in, token_in_address)
+        else:
+            return await self.swap_via_v3_router(amount_in, token_in_address)
     
     async def pre_validate_transfers(self, asset: str, amount: float, max_transfer_time_seconds: int = 10) -> bool:
         """
@@ -1052,50 +1304,44 @@ class Uniswap(BaseExchange):
             
             return upward_price_impact if direction == 'buy' else downward_price_impact
     
-    async def _compute_wrap_cost(self, asset: str) -> float:
+    async def _compute_wrap_cost(self) -> float:
         """
         Compute the wrap cost for a specific asset.
         """
-        if asset != 'ETH':
-            return 0
-        
-        cost_info = await self.token_monitor.get_eth_wrap_gas()
-        cost_in_asset = cost_info['cost_wei'] / self.get_asset_decimals(asset)
+        cost_info = self.token_monitor.get_eth_wrap_gas()
+        cost_in_asset = float(cost_info['cost_wei']) / (10 ** self.get_asset_decimals(self.base_asset))
         return cost_in_asset
     
-    async def _compute_unwrap_cost(self, asset: str) -> float:
+    async def _compute_unwrap_cost(self) -> float:
         """
         Compute the unwrap cost for a specific asset.
         """
-        if asset != 'WETH':
-            return 0
-        
-        cost_info = await self.token_monitor.get_eth_unwrap_gas()
-        cost_in_asset = cost_info['cost_wei'] / self.get_asset_decimals(asset)
+        cost_info = self.token_monitor.get_eth_unwrap_gas()
+        cost_in_asset = float(cost_info['cost_wei']) / (10 ** self.get_asset_decimals(self.base_asset))
         return cost_in_asset
     
     async def _compute_transfer_cost(self, asset: str) -> float:
         """
         Compute the transfer cost for a specific asset.
         """
-        cost_info = await self.token_monitor.get_token_transfer_gas(self.get_asset_address(asset))
-        cost_in_asset = cost_info['cost_wei'] / self.get_asset_decimals(asset)
+        cost_info = self.token_monitor.get_token_transfer_gas(self.get_asset_address(asset))
+        cost_in_asset = cost_info['cost_wei'] / (10 ** self.get_asset_decimals(asset))
         return cost_in_asset
     
     async def _compute_pool_swap_gas_cost(self, asset: str) -> float:
         """
         Compute the pool swap gas cost for a specific asset.
         """
-        cost_info = await self.token_monitor.get_v3_swap_gas(self.pool_address)
-        cost_in_asset = cost_info['cost_wei'] / self.get_asset_decimals(asset)
+        cost_info = self.token_monitor.get_v3_swap_gas(self.pool_address)
+        cost_in_asset = cost_info['cost_wei'] / (10 ** self.get_asset_decimals(asset))
         return cost_in_asset
     
     async def compute_buy_and_transfer_costs(self, asset: str, amount: float) -> float:
         """
         Compute the buy and transfer costs for a specific asset.
             Costs
-             1. Slippage cost
-             2. Pool fee (fixed)
+             1. Pool fee
+             2. Slippage cost
              3. Pool swap gas cost
              4. Wrapping gas cost
              5. Transfer gas cost
@@ -1107,17 +1353,18 @@ class Uniswap(BaseExchange):
         """
         # Calculate slippage and fee costs precisely
         # First apply pool fee, then calculate slippage on remaining amount
-        fee_cost = amount * (self.metadata['pool_fee']/1_000_000)
+        fee_cost = amount * (self.metadata['fee_tier']/1_000_000)
         amount_after_fee = amount - fee_cost
-        slippage_cost = await self._compute_slippage_cost(asset, amount_after_fee, 'buy') * amount_after_fee / 10_000
+        slippage_bps = await self._compute_slippage_cost(asset, amount_after_fee, 'buy')
+        slippage_cost = slippage_bps * amount_after_fee / 10_000
 
         swap_gas_cost = await self._compute_pool_swap_gas_cost(asset)
         execution_cost = fee_cost + slippage_cost + swap_gas_cost
         
-        wrap_cost = await self._compute_wrap_cost(asset)
+        wrap_cost = await self._compute_wrap_cost()
         transfer_cost = await self._compute_transfer_cost(asset)
         
-        logger.info(f'slippage_cost: {slippage_cost}, swap_gas_cost: {swap_gas_cost}, wrap_cost: {wrap_cost}, transfer_cost: {transfer_cost}')
+        logger.info(f'slippage_bps: {slippage_bps}, swap_gas_cost: {swap_gas_cost}, wrap_cost: {wrap_cost}, transfer_cost: {transfer_cost}')
         total_cost = execution_cost + wrap_cost + transfer_cost
         return total_cost / amount * 10_000
     
@@ -1132,14 +1379,14 @@ class Uniswap(BaseExchange):
         """
         # Calculate slippage and fee costs precisely
         # First apply pool fee, then calculate slippage on remaining amount
-        fee_cost = amount * (self.metadata['pool_fee']/1_000_000)
+        fee_cost = amount * (self.metadata['fee_tier']/1_000_000)
         amount_after_fee = amount - fee_cost
         slippage_cost = await self._compute_slippage_cost(asset, amount_after_fee, 'sell') * amount_after_fee / 10_000
 
         swap_gas_cost = await self._compute_pool_swap_gas_cost(asset)
         execution_cost = fee_cost + slippage_cost + swap_gas_cost
         
-        unwrap_cost = await self._compute_unwrap_cost(asset)
+        unwrap_cost = await self._compute_unwrap_cost()
         logger.info(f'slippage_cost: {slippage_cost}, swap_gas_cost: {swap_gas_cost}, unwrap_cost: {unwrap_cost}')
         return execution_cost + unwrap_cost
     
@@ -1176,11 +1423,11 @@ class Uniswap(BaseExchange):
         """
         return await self.get_deposit_address(self.base_asset)
     
-    async def get_base_asset_balance(self) -> float:
+    async def get_base_asset_balance(self, live=False) -> float:
         """
         Get the current balance of the base asset.
         """
-        return await self.get_balance(self.base_asset)
+        return await self.get_balance(self.base_asset, live=live)
     
     async def wrap_asset(self, asset: str, amount: float) -> float:
         """
@@ -1195,31 +1442,44 @@ class Uniswap(BaseExchange):
         logger.info(f"Wrapping {amount} {asset} to {wrapped_asset}")
 
         # Convert amount to wei
-        amount_wei = await self.async_w3.to_wei(amount, 'ether')
+        amount_wei = self.async_w3.to_wei(amount, 'ether')
 
         try:
             # Build the deposit transaction
             contract = self.async_w3.eth.contract(address=self.get_asset_address(wrapped_asset), abi=self.ERC20_ABI)
-            tx = contract.functions.deposit().build_transaction({
+            tx = await contract.functions.deposit().build_transaction({
                 'chainId': await self.async_w3.eth.chain_id,
                 'gas': 100000,  # Standard gas limit for wrapping
-                'maxPriorityFeePerGas': await self.web3.eth.max_priority_fee,
-                'maxFeePerGas': await self.web3.eth.gas_price,
-                'nonce': await self.web3.eth.get_transaction_count(self.wallet_address),
+                'maxPriorityFeePerGas': await self.async_w3.eth.max_priority_fee,
+                'maxFeePerGas': await self.async_w3.eth.gas_price,
+                'nonce': await self.async_w3.eth.get_transaction_count(self.account.address),
                 'value': amount_wei,  # Amount to wrap in wei
             })
 
             # Sign and send the transaction
-            signed_tx = self.web3.eth.account.sign_transaction(tx, self.wallet_private_key)
-            tx_hash = await self.web3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            signed_tx = self.async_w3.eth.account.sign_transaction(tx, self.wallet_private_key)
+            logger.info(f"Signing transaction: {tx}")
+            tx_hash = await self.async_w3.eth.send_raw_transaction(signed_tx.raw_transaction)
             
             # Wait for transaction receipt
-            tx_receipt = await self.web3.eth.wait_for_transaction_receipt(tx_hash)
+            tx_receipt = await self.async_w3.eth.wait_for_transaction_receipt(tx_hash, timeout=240)
             
             if tx_receipt['status'] == 1:
-                logger.info(f"Successfully wrapped {amount} {asset} to {wrapped_asset}")
-                logger.info(f"Transaction hash: {tx_hash.hex()}")
-                return tx_receipt['value'] / self.get_asset_decimals(wrapped_asset)
+                # Get amount from the Deposit event logs
+                # Find the Deposit event in the logs, handling case where it may not exist
+                deposit_events = [log for log in tx_receipt['logs'] if len(log['topics']) > 0 and 
+                                log['topics'][0].hex() == '0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c']
+                
+                if deposit_events:
+                    deposit_event = deposit_events[0]
+                    wrapped_amount = int(deposit_event['data'], 16) / (10 ** self.get_asset_decimals(wrapped_asset))
+                    logger.info(f"Successfully wrapped {wrapped_amount} {asset} to {wrapped_asset}")
+                    return wrapped_amount
+                else:
+                    # If no Deposit event found, use the transaction value as fallback
+                    wrapped_amount = amount_wei / (10 ** self.get_asset_decimals(wrapped_asset))
+                    logger.warning(f"No Deposit event found, using tx value: {wrapped_amount}")
+                    return wrapped_amount
             else:
                 logger.error(f"Failed to wrap {asset}. Transaction reverted.")
                 return 0
@@ -1241,26 +1501,51 @@ class Uniswap(BaseExchange):
         logger.info(f"Unwrapping {amount} {asset} to {unwrapped_asset}")
         
         # Convert amount to wei
-        amount_wei = await self.async_w3.to_wei(amount, 'ether')
+        amount_wei = self.async_w3.to_wei(amount, 'ether')
 
         try:
             # Build the unwrap transaction
             contract = self.async_w3.eth.contract(address=self.get_asset_address(asset), abi=self.ERC20_ABI)
-            tx = contract.functions.withdraw(amount_wei).build_transaction({
+            tx = await contract.functions.withdraw(amount_wei).build_transaction({
                 'chainId': await self.async_w3.eth.chain_id,
                 'gas': 100000,  # Standard gas limit for unwrapping
+                'maxPriorityFeePerGas': await self.async_w3.eth.max_priority_fee,
+                'maxFeePerGas': await self.async_w3.eth.gas_price,
+                'nonce': await self.async_w3.eth.get_transaction_count(self.account.address),
             })
 
             # Sign and send the transaction
             signed_tx = self.async_w3.eth.account.sign_transaction(tx, self.wallet_private_key)
-            tx_hash = await self.async_w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            logger.info(f"Signing transaction: {tx}")
+            tx_hash = await self.async_w3.eth.send_raw_transaction(signed_tx.raw_transaction)
             
             # Wait for transaction receipt
-            tx_receipt = await self.async_w3.eth.wait_for_transaction_receipt(tx_hash)
+            tx_receipt = await self.async_w3.eth.wait_for_transaction_receipt(tx_hash, timeout=240)
             
             if tx_receipt['status'] == 1:
                 logger.info(f"Successfully unwrapped {amount} {asset} to {unwrapped_asset}")
-                return tx_receipt['value'] / self.get_asset_decimals(unwrapped_asset)
+                
+                # The issue is here: tx['value'] is not the unwrapped amount.
+                # Instead, extract the amount from the event logs
+                # The Withdrawal event is emitted by the WETH contract with the amount in the data field
+                
+                # Check if logs exist in the receipt
+                if 'logs' in tx_receipt and len(tx_receipt['logs']) > 0:
+                    # Get the log data (the amount is in the data field of the Withdrawal event)
+                    log_data = tx_receipt['logs'][0]['data']
+                    
+                    # Convert the hex data to int (skip '0x' prefix)
+                    unwrapped_amount_wei = int(log_data.hex(), 16)
+                    
+                    # Convert from wei to ether
+                    unwrapped_amount = self.async_w3.from_wei(unwrapped_amount_wei, 'ether')
+                    
+                    logger.info(f"Unwrapped amount from logs: {unwrapped_amount} ETH")
+                    return float(unwrapped_amount)
+                else:
+                    # If no logs are found, return the original amount as a fallback
+                    logger.warning("No logs found in transaction receipt, returning original amount")
+                    return amount
             else:
                 logger.error(f"Failed to unwrap {asset}. Transaction reverted.")
                 return 0
@@ -1281,21 +1566,57 @@ async def main():
         infura_ws_url = config.infura_ws_url
         pool_address = config.instrument_config[0]['pool_address']  
         private_key = config.wallet_private_key
-        base_asset = config.instrument_config[0]['base_asset']
-        quote_asset = config.instrument_config[0]['quote_asset']
+        base_asset = config.instrument_config[0]['uniswap_base_asset']
+        quote_asset = config.instrument_config[0]['uniswap_quote_asset']
+        enable_flash_bot = config.instrument_config[0]['enable_flash_bot']
 
         # Initialize the connector
-        uniswap = Uniswap(infura_url, infura_ws_url, pool_address, private_key, base_asset, quote_asset)
+        uniswap = Uniswap(infura_url, infura_ws_url, pool_address, private_key, base_asset, quote_asset, enable_flash_bot)
         await uniswap.init()
         logger.info(f"Pool contains {uniswap.metadata['token0'].symbol} and {uniswap.metadata['token1'].symbol}")
-        
+        tx_hash = "ce30942768bfdcf941f6d4e450275067acc23bd573cdcbd863dbdec1895c7447"
+        withdrawal_info = {'status': 'success', 'tx_hash': '0xbe06419a19b6b13c14f7aa1a950bc78b00b3321378f5bd0b5c4d1dc2c7148ded', 'amount': 0.002}
+
+        # Test wrapping
+        test_wrap = False
+        if test_wrap:
+            eth_balance = await uniswap.get_balance("ETH", live=True) * 0.1
+            wrapped_amount = await uniswap.wrap_asset(asset="ETH", amount=eth_balance)
+            logger.info(f"Wrapped amount: {wrapped_amount}")
+
+        # Test unwrapping
+        test_unwrap = False
+        if test_unwrap:
+            weth_balance = await uniswap.get_balance("WETH", live=True) 
+            unwrapped_amount = await uniswap.unwrap_asset(asset="WETH", amount=weth_balance)
+            logger.info(f"Unwrapped amount: {unwrapped_amount}")
+
+        # Test swap
+        test_swap = False
+        if test_swap:
+            swap_amount = await uniswap.get_balance("WETH", live=True) 
+            tx_hash = await uniswap.execute_trade(trade_direction="sell", trade_size=swap_amount)
+            logger.info(f"Trade response: {tx_hash}")
+
+        # Test Tradeconfirmation
+        test_confirm_trade = True
+        if test_confirm_trade:
+            confirmed_amount = await uniswap.confirm_trade(tx_hash)
+            logger.info(f"Confirmed amount: {confirmed_amount}")
+
         # Test withdraw
-        deposit_address = "0x3e6b04c2f793d77d6414075aae1d44ef474b483e"
-        withdrawal_info = await uniswap.withdraw(asset="ETH", address=deposit_address, amount=0.002)
-        logger.info(f"Withdrawal info: {withdrawal_info}")
-        # withdrawal_info = {'status': 'success', 'tx_hash': '0xbe06419a19b6b13c14f7aa1a950bc78b00b3321378f5bd0b5c4d1dc2c7148ded', 'amount': 0.002}
-        confirmed_amount = await uniswap.confirm_withdrawal(withdrawal_info)
-        logger.info(f"Confirmed amount: {confirmed_amount}")
+        test_withdraw = False
+        if test_withdraw:
+            deposit_address = "0x3e6b04c2f793d77d6414075aae1d44ef474b483e"
+            ETH_BALANCE = await uniswap.get_balance("ETH", live=True) * 0.5
+            withdrawal_info = await uniswap.withdraw(asset="ETH", address=deposit_address, amount=ETH_BALANCE)
+            logger.info(f"Withdrawal info: {withdrawal_info}")
+
+        # Test withdraw confirmation
+        test_withdraw_confirmation = False
+        if test_withdraw_confirmation:
+            confirmed_amount = await uniswap.confirm_withdrawal(withdrawal_info)
+            logger.info(f"Confirmed amount: {confirmed_amount}")
 
 
         while True:

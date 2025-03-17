@@ -68,25 +68,24 @@ The `config.json` file contains essential parameters and API keys required for t
     "blocknative_api_key": "your_blocknative_api_key",
     "instrument_config": [
         {
-            "instrument": "ETHUSDC",
-            "pool_address": "your_pool_address",
-            "base_token": "ETH",
-            "quote_token": "USDC",
-            "base_token_address": "your_base_token_address",
-            "quote_token_address": "your_quote_token_address"
+            "binance_instrument": "ETHUSDC",
+            "uniswap_instrument": "WETH",
+            "pool_address": "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640",
+            "binance_base_asset": "ETH",
+            "binance_quote_asset": "USDC",
+            "uniswap_base_asset": "WETH",
+            "uniswap_quote_asset": "USDC",
+            "enable_flash_bot": false
         }
     ],
     "arb_config": {
         "min_price_dislocation_bps": 100,
-        "min_profit_threshold": 0.5,
+        "min_profit_bps": 5,
+        "size_scale_factor": 0.1,
         "slippage_tolerance": 1.0,
-        "gas_fee_limit": 100.0,
         "order_size_limit": 1.0,
         "execution_mode": "both",
         "max_transfer_time_seconds": 10,
-        "max_transaction_cost_bps": 50,
-        "disable_blocknative_simulation": false,
-        "disable_network_level_validations": false,
         "min_rollback_order_size": 0.001
     }
 }
@@ -102,16 +101,13 @@ execution_mode can be:
 The `arb_config` section in the `config.json` file defines the parameters for the arbitrage strategy:
 
 - **min_price_dislocation_bps**: Minimum basis points of price dislocation required to consider an arbitrage opportunity.
-- **min_profit_threshold**: Minimum profit threshold in percentage required to execute an arbitrage trade.
+- **min_profit_bps**: Minimum profit threshold in bps required to execute an arbitrage trade after costs.
 - **slippage_tolerance**: Maximum acceptable slippage in percentage during trade execution.
-- **gas_fee_limit**: Maximum gas fee allowed for executing trades, in Gwei.
 - **order_size_limit**: Maximum size of each order to manage risk and liquidity.
 - **execution_mode**: Determines the direction of arbitrage execution. Options are "both", "binance_to_uniswap", or "uniswap_to_binance".
 - **max_transfer_time_seconds**: Maximum time allowed for asset transfers between exchanges, in seconds.
-- **max_transaction_cost_bps**: Maximum transaction cost in basis points allowed for executing trades.
-- **disable_blocknative_simulation**: Boolean flag to disable Blocknative simulation for transaction validation.
-- **disable_network_level_validations**: Boolean flag to disable network-level validations such as gas costs and slippage.
 - **min_rollback_order_size**: Minimum order size required to trigger a rollback in case of execution failure.
+- **enable_flash_bot**: To enable/disable swaps via flashbot (default: V3 router)
 
 ## Arbitrage Execution and Rollback
 

@@ -94,7 +94,7 @@ class BaseExchange(abc.ABC):
         raise NotImplementedError()
     
     @abc.abstractmethod
-    async def get_base_asset_balance(self) -> float:
+    async def get_base_asset_balance(self, live=False) -> float:
         """
         Get the current balance of the base asset.
         """

@@ -1,4 +1,5 @@
 import logging
+import traceback
 from exchanges.base_connector import BaseExchange
 
 logger = logging.getLogger(__name__)
@@ -31,7 +32,7 @@ class ExecutionEngine:
                 return False
 
             # Step 3: Unwrap base asset if necessary
-            unwrapped_confirmed_size = await buy_exchange.unwrap_asset(arb_instrument, confirmed_size)
+            unwrapped_confirmed_size = await buy_exchange.unwrap_asset(buy_exchange.base_asset, confirmed_size)
             logger.info(f"Unwrapped confirmed size: {unwrapped_confirmed_size}")
 
             # Step 4: Transfer bought assets to sell venue
@@ -91,21 +92,19 @@ class ExecutionEngine:
         logger.info("Unwinding arbitrage position...")
         try:
             # Check current balances
-            buy_exchange_balance = await buy_exchange.get_base_asset_balance()
-            sell_exchange_balance = await sell_exchange.get_base_asset_balance()
-            logger.info(f"Current buy balance: {buy_exchange_balance}, sell balance: {sell_exchange_balance}")
+            buy_exchange_balance = await buy_exchange.get_base_asset_balance(live=True)
+            sell_exchange_balance = await sell_exchange.get_base_asset_balance(live=True)
+            logger.info(f"{buy_exchange.__class__.__name__} balance({buy_exchange.base_asset}): {buy_exchange_balance}, {sell_exchange.__class__.__name__} balance({sell_exchange.base_asset}): {sell_exchange_balance}")
 
             # Sell any holdings if above min_rollback_size
-            # First wrap if necessary and then sell (In case there was some error during wrapping/unwrapping)
             if buy_exchange_balance > min_rollback_size:
-                wrapped_buy_exchange_balance = await buy_exchange.wrap_asset(arb_instrument, buy_exchange_balance)
-                await buy_exchange.execute_trade('sell', wrapped_buy_exchange_balance)
-                logger.info(f"Sold {wrapped_buy_exchange_balance} of {arb_instrument} on buy exchange.")
+                await buy_exchange.execute_trade('sell', buy_exchange_balance)
+                logger.info(f"Sold {buy_exchange_balance} of {buy_exchange.base_asset} on {buy_exchange.__class__.__name__}.")
 
             if sell_exchange_balance > min_rollback_size:
-                wrapped_sell_exchange_balance = await sell_exchange.wrap_asset(arb_instrument, sell_exchange_balance)
-                await sell_exchange.execute_trade('sell', wrapped_sell_exchange_balance)
-                logger.info(f"Sold {wrapped_sell_exchange_balance} of {arb_instrument} on sell exchange.")
+                await sell_exchange.execute_trade('sell', sell_exchange_balance)
+                logger.info(f"Sold {sell_exchange_balance} of {sell_exchange.base_asset} on {sell_exchange.__class__.__name__}.")
 
         except Exception as rollback_error:
             logger.error(f"Rollback failed: {rollback_error}")
+            logger.error(traceback.format_exc())

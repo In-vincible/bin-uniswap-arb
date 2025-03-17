@@ -86,7 +86,7 @@ class TradingEngine:
         self.logger.info("Shutting down trading engine gracefully")
         self.running = False
         
-        # Cleanup will stop the strategy
+        # Cleanup will stop the strategy and close all positions (by selling all positions)
         await self.cleanup()
         
         self.logger.info("Trading engine shutdown complete")

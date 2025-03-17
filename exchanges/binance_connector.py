@@ -253,7 +253,7 @@ class Binance(BaseExchange):
         Retrieves the account balances for the specified assets.
         Returns a dictionary mapping each asset to its free and locked balances.
         """
-        if live:
+        if live or len(self.balances) == 0:
             return await self._update_balance_cache()
         else:
             return self.balances
@@ -331,10 +331,10 @@ class Binance(BaseExchange):
         except Exception as e:
             logger.error(f"Failed to execute trade: {str(e)}")
             return {
-                'status': 'error',
-                'error': str(e),
-                'trade_size': 0
-            }
+                    'status': 'error',
+                    'error': str(e),
+                    'trade_size': 0
+                }
 
     async def confirm_trade(self, trade):
         """
@@ -415,15 +415,20 @@ class Binance(BaseExchange):
         Returns:
             float: The execution costs in BPS
         """
-        # First calculate how much we'll receive after paying taker fee
-        post_execution_amount = amount * (1 - (self.taker_fee_bps / 10000))  # Convert bps to decimal
-        
-        # Then calculate how much we'll have after withdrawal fee
+        slippage_bps = (await self.get_current_price(self.instrument) - self.market_data[self.instrument]['best_ask']) / self.market_data[self.instrument]['best_ask'] * 10_000
+        slippage_cost = slippage_bps * amount / 10_000
+        post_execution_amount = amount - slippage_cost
+
+        # apply taker fee post execution
+        taker_fee_cost = post_execution_amount * (self.taker_fee_bps / 10000)
+        post_execution_amount = post_execution_amount - taker_fee_cost
+
+        # apply withdrawal fee
         withdrawal_fee = await self.get_withdrawal_fee(asset)
         final_amount = post_execution_amount - withdrawal_fee
         
-        # Return total cost in bps
-        total_cost_bps = (1 - final_amount / amount) * 10000
+        logger.info(f"slippage_bps: {slippage_bps}, toker_fee_bps: {self.taker_fee_bps}, withdrawal_fee: {withdrawal_fee}")
+        total_cost_bps = (1 - final_amount / amount) * 10_000
         return total_cost_bps
     
     async def compute_sell_costs(self, asset: str, amount: float) -> float:
@@ -437,7 +442,16 @@ class Binance(BaseExchange):
         Returns:
             float: The execution costs in BPS
         """
-        return self.taker_fee_bps
+        # For binance fee applies post execution
+        ideal_sell_accrual = await self.get_current_price(self.instrument) * amount
+        real_sell_accrual = self.market_data[self.instrument]['best_bid'] * amount
+        slippage_cost_in_quote_asset = real_sell_accrual - ideal_sell_accrual
+
+        fee_cost_in_quote_asset = real_sell_accrual * self.taker_fee_bps / 10_000
+        total_cost_in_quote_asset = slippage_cost_in_quote_asset + fee_cost_in_quote_asset
+        total_cost_bps = (total_cost_in_quote_asset / ideal_sell_accrual) * 10_000
+        
+        return total_cost_bps
     
     async def get_base_asset_price(self) -> float:
         """
@@ -451,11 +465,11 @@ class Binance(BaseExchange):
         """
         return await self.get_deposit_address(self.base_asset)
     
-    async def get_base_asset_balance(self) -> float:
+    async def get_base_asset_balance(self, live=False) -> float:
         """
         Get the current balance of the base asset.
         """
-        return await self.get_balance(self.base_asset)
+        return await self.get_balance(self.base_asset, live=live)
     
     async def wrap_asset(self, asset: str, amount: float) -> float:
         """
