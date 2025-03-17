@@ -15,10 +15,12 @@ logging.basicConfig(
 logger = logging.getLogger("binance_connector")
 
 class Binance(BaseExchange):
-    def __init__(self, api_key: str, secret_key: str, instrument: str, balance_update_interval: int = 10, deposit_withdraw_check_interval: int = 10):
+    def __init__(self, api_key: str, secret_key: str, instrument: str, base_asset: str, quote_asset: str, balance_update_interval: int = 10, deposit_withdraw_check_interval: int = 10):
         self.api_key = api_key
         self.secret_key = secret_key
         self.instrument = instrument
+        self.base_asset = base_asset
+        self.quote_asset = quote_asset
         self.client = None
         self.bsm = None
         self.market_data = {}
@@ -131,6 +133,10 @@ class Binance(BaseExchange):
         if symbol in self.market_data:
             self.market_data[symbol]['price'] = float(msg.get('c', 0))  # 'c' is the close price
             self.market_data[symbol]['timestamp'] = msg.get('E', 0)  # 'E' is the event time
+            self.market_data[symbol]['best_bid'] = float(msg.get('b', 0))  # 'b' is the best bid price
+            self.market_data[symbol]['best_bid_quantity'] = float(msg.get('B', 0))  # 'B' is the best bid quantity
+            self.market_data[symbol]['best_ask'] = float(msg.get('a', 0))  # 'a' is the best ask price
+            self.market_data[symbol]['best_ask_quantity'] = float(msg.get('A', 0))  # 'A' is the best ask quantity
             self.market_data[symbol]['last_update_time'] = time.time()
     
     def get_latest_price(self, symbol):
@@ -157,13 +163,10 @@ class Binance(BaseExchange):
         Returns:
             float: The current price of the asset
         """
-        base_token_price = self.get_latest_price(self.instrument)['price']
-        if asset == self.metadata['baseAsset']:
-            return base_token_price
-        elif asset == self.metadata['quoteAsset']:
-            return 1 / base_token_price
-        else:
-            raise ValueError(f"Unsupported asset: {asset}")
+        if asset not in self.market_data:
+            raise ValueError(f"Asset {asset} not found in market data")
+        
+        return self.get_latest_price(asset)['price']
     
     def get_all_prices(self):
         """
@@ -239,22 +242,16 @@ class Binance(BaseExchange):
         else:
             return self.balances
     
-    async def get_tob_size(self, symbol: str, side: str):
+    async def get_max_executible_size(self, symbol: str, side: str):
         """
         Get the TOB size for a given symbol.
         """
-        # Get the order book depth to find the top of book size
-        depth = await self.client.get_order_book(symbol=symbol, limit=1)
         if side == 'buy':
-            if depth and len(depth['bids']) > 0:
-                # Return the size at the best bid
-                return float(depth['bids'][0][1])
-            return 0.0  # Return 0 if no valid depth data
+            return self.market_data[symbol]['best_ask_quantity']
         elif side == 'sell':
-            if depth and len(depth['asks']) > 0:
-                # Return the size at the best ask
-                return float(depth['asks'][0][1])
-        return 0.0  # Return 0 if no valid depth data
+            return self.market_data[symbol]['best_bid_quantity']
+        else:
+            raise ValueError(f"Invalid side: {side}. Must be 'buy' or 'sell'")
     
     async def verify_withdrawal_open(self, asset: str, live=False):
         """
@@ -425,15 +422,45 @@ class Binance(BaseExchange):
             float: The execution costs in BPS
         """
         return self.taker_fee_bps
-        
+    
+    async def get_base_asset_price(self) -> float:
+        """
+        Get the current price of the base asset.
+        """
+        return await self.get_current_price(self.instrument)
+    
+    async def get_base_asset_deposit_address(self) -> str:
+        """
+        Get the deposit address for the base asset.
+        """
+        return await self.get_deposit_address(self.base_asset)
+    
+    async def get_base_asset_balance(self) -> float:
+        """
+        Get the current balance of the base asset.
+        """
+        return await self.get_balance(self.base_asset)
+    
+    async def wrap_asset(self, asset: str, amount: float) -> float:
+        """
+        Not required for Binance.
+        """
+        pass
+    
+    async def unwrap_asset(self, asset: str, amount: float) -> float:
+        """
+        Not required for Binance.
+        """
+        pass
 
 # --- Async test code in __main__ ---
 async def main():
     config = Config()
     instrument = "ETHUSDC"
     asset_list = ["ETH", "USDC"]
-
-    connector = Binance(config.binance_api_key, config.binance_api_secret, instrument)
+    base_asset = "ETH"
+    quote_asset = "USDC"
+    connector = Binance(config.binance_api_key, config.binance_api_secret, instrument, base_asset, quote_asset)
     await connector.init()
 
     
@@ -561,13 +588,11 @@ async def main():
         
     # Get updated prices
     while True:
-        updated_eth_price = connector.get_current_price("ETH")
-        updated_usdc_price = connector.get_current_price("USDC")
-        logger.info(f"Updated ETH price: {updated_eth_price} USDC")
-        logger.info(f"Updated USDC price: {updated_usdc_price} ETH")
+        base_asset_price = await connector.get_base_asset_price()
+        logger.info(f"{connector.base_asset} price: {base_asset_price}")
         logger.info(f"Balances: {await connector.get_balances()}")
-        logger.info(f"Deposit status: {await connector.verify_deposit_open('USDC')}")
-        logger.info(f"Withdrawal status: {await connector.verify_withdrawal_open('USDC')}")
+        logger.info(f"Deposit status: {await connector.verify_deposit_open(connector.base_asset)}")
+        logger.info(f"Withdrawal status: {await connector.verify_withdrawal_open(connector.base_asset)}")
         await asyncio.sleep(1)
     
 

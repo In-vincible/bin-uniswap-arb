@@ -1,7 +1,6 @@
 import math
 from typing import Any, Dict
 from web3 import Web3, AsyncWeb3
-from decimal import Decimal, getcontext
 from web3.providers.persistent import WebSocketProvider
 from web3.utils.subscriptions import LogsSubscription
 import logging
@@ -17,8 +16,9 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
+
 logger = logging.getLogger("uniswap_pool_monitor")
-TICK_BASE = Decimal(1.0001)
+TICK_BASE = float(1.0001)
 
 class Token:
     def __init__(self, address: str, symbol: str, decimals: int):
@@ -59,7 +59,7 @@ class Uniswap(BaseExchange):
         {"constant": False, "inputs": [{"name": "_to", "type": "address"}, {"name": "_value", "type": "uint256"}], "name": "transfer", "outputs": [{"name": "success", "type": "bool"}], "payable": False, "stateMutability": "nonpayable", "type": "function"},
     ]
     
-    def __init__(self, infura_url, infura_ws_url, pool_address, private_key, balance_update_interval=15):
+    def __init__(self, infura_url, infura_ws_url, pool_address, private_key, base_asset: str, quote_asset: str, balance_update_interval=15):
         """
         Initialize the PoolMonitor with Ethereum connection and pool contract.
         
@@ -85,6 +85,8 @@ class Uniswap(BaseExchange):
         self.tick = None
         self.balances = {}
         self.balance_update_interval = balance_update_interval
+        self.base_asset = base_asset
+        self.quote_asset = quote_asset
     
     async def init(self):
         """
@@ -281,20 +283,20 @@ class Uniswap(BaseExchange):
         """
         if self.liquidity is None or self.sqrt_price is None:
             logger.warning("Liquidity or sqrt_price not available, cannot compute upward swap.")
-            return Decimal(0), Decimal(0)
+            return float(0), float(0)
         
         # Get sqrtPriceX96 boundaries
         _, sqrt_price_upper = self.get_sqrt_price_x96_boundaries(self.tick)
         
         # Convert sqrtPrice values to Decimal and scale them down from X96 format
         # Divide by 2^96 to get the correct scale for price calculations
-        scale_factor = Decimal(2) ** 96
-        sqrt_price_current = Decimal(self.sqrt_price) / scale_factor
-        sqrt_price_next = Decimal(sqrt_price_upper) / scale_factor
+        scale_factor = float(2) ** 96
+        sqrt_price_current = float(self.sqrt_price) / scale_factor
+        sqrt_price_next = float(sqrt_price_upper) / scale_factor
         
         # Convert liquidity to Decimal for precision
         # Liquidity in Uniswap v3 is expressed in L units
-        liquidity = Decimal(self.liquidity)
+        liquidity = float(self.liquidity)
         
         # Calculate maximum amounts using the Uniswap V3 formula
         # Δx = L * (√P₂ - √P₁) / (√P₁ * √P₂)
@@ -305,8 +307,8 @@ class Uniswap(BaseExchange):
         
         # Apply token decimal adjustments
         # These conversions depend on the specific token's decimal places
-        token0_amount = token0_amount / Decimal(10**self.metadata['token0'].decimals)
-        token1_amount = token1_amount / Decimal(10**self.metadata['token1'].decimals)
+        token0_amount = token0_amount / float(10**self.metadata['token0'].decimals)
+        token1_amount = token1_amount / float(10**self.metadata['token1'].decimals)
         
         return token0_amount, token1_amount
     
@@ -328,19 +330,19 @@ class Uniswap(BaseExchange):
         """
         if self.liquidity is None or self.sqrt_price is None:
             logger.warning("Liquidity or sqrt_price not available, cannot compute downward swap.")
-            return Decimal(0), Decimal(0)
+            return float(0), float(0)
             
         # Get sqrtPriceX96 boundaries
         sqrt_price_lower, _ = self.get_sqrt_price_x96_boundaries(self.tick)
         
         # Convert sqrtPrice values to Decimal and scale them down from X96 format
         # Divide by 2^96 to get the correct scale for price calculations
-        scale_factor = Decimal(2) ** 96
-        sqrt_price_current = Decimal(self.sqrt_price) / scale_factor
-        sqrt_price_prev = Decimal(sqrt_price_lower) / scale_factor
+        scale_factor = float(2) ** 96
+        sqrt_price_current = float(self.sqrt_price) / scale_factor
+        sqrt_price_prev = float(sqrt_price_lower) / scale_factor
         
         # Convert liquidity to Decimal for precision
-        liquidity = Decimal(self.liquidity)
+        liquidity = float(self.liquidity)
         
         # Calculate maximum amounts using the Uniswap V3 formula
         # For downward price movement (√P₁ > √P₀):
@@ -353,12 +355,12 @@ class Uniswap(BaseExchange):
         token0_out_max = liquidity * (sqrt_price_current - sqrt_price_prev) / (sqrt_price_current * sqrt_price_prev)
         
         # Apply token decimal adjustments
-        token0_out_max = token0_out_max / Decimal(10**self.metadata['token0'].decimals)
-        token1_in_max = token1_in_max / Decimal(10**self.metadata['token1'].decimals)
+        token0_out_max = token0_out_max / float(10**self.metadata['token0'].decimals)
+        token1_in_max = token1_in_max / float(10**self.metadata['token1'].decimals)
         
         # Ensure we don't return negative values due to calculation precision errors
-        token0_out_max = max(Decimal(0), token0_out_max)
-        token1_in_max = max(Decimal(0), token1_in_max)
+        token0_out_max = max(float(0), token0_out_max)
+        token1_in_max = max(float(0), token1_in_max)
         
         # Return in token0, token1 order for consistency
         return token0_out_max, token1_in_max
@@ -375,8 +377,8 @@ class Uniswap(BaseExchange):
         if sqrt_price_x96 is None:
             return None, None
         # Convert sqrtPriceX96 to Decimal and scale it down from X96 format
-        scale_factor = Decimal(2) ** 96
-        sqrt_price_x96 = Decimal(sqrt_price_x96) / scale_factor
+        scale_factor = float(2) ** 96
+        sqrt_price_x96 = float(sqrt_price_x96) / scale_factor
         
         # Calculate price of token0 in terms of token1
         price_token0_in_token1 = sqrt_price_x96 ** 2
@@ -385,7 +387,7 @@ class Uniswap(BaseExchange):
         price_token1_in_token0 = 1 / price_token0_in_token1 if price_token0_in_token1 != 0 else 0
 
         # Adjust for decimal differences
-        decimal_adjustment = Decimal(10**self.metadata['token1'].decimals) / Decimal(10**self.metadata['token0'].decimals)
+        decimal_adjustment = float(10**self.metadata['token1'].decimals) / float(10**self.metadata['token0'].decimals)
         price_token0_in_token1 = price_token0_in_token1 / decimal_adjustment
         price_token1_in_token0 = price_token1_in_token0 * decimal_adjustment
         
@@ -665,8 +667,6 @@ class Uniswap(BaseExchange):
             return 18
         else:
             raise ValueError(f"Unsupported asset: {asset}")
-    
-
 
     async def withdraw(self, asset: str, address: str, amount: float) -> Dict[str, Any]:
         """
@@ -839,17 +839,284 @@ class Uniswap(BaseExchange):
         
         return True
     
+    async def _compute_slippage_cost(self, asset: str, amount: float, direction: str) -> float:
+        """
+        Compute the slippage cost in basis points (bps) for a specific asset and amount.
+        
+        This calculates the price impact of executing a trade of the given size by comparing
+        the effective execution price to the current market price.
+        
+        Args:
+            asset (str): Asset symbol to compute slippage for
+            amount (float): Amount of asset to trade
+            direction (str): Trade direction - either 'buy' or 'sell'
+            
+        Returns:
+            float: Slippage cost in basis points (bps). Positive values indicate worse prices.
+        """
+        # Get current market price from sqrt price
+        token0_price, token1_price = self.compute_price_from_sqrt_price_x96()
+        current_market_price = token1_price  # Standard quote is token0 per token1
+        
+        # Determine if this is an upward or downward swap based on asset and direction
+        is_token0 = (asset == self.metadata['token0'].symbol)
+        
+        # For token0 (e.g. USDC):
+        # - Buying token0 = downward swap (selling token1)
+        # - Selling token0 = upward swap (buying token1)
+        
+        # For token1 (e.g. WETH):
+        # - Buying token1 = upward swap
+        # - Selling token1 = downward swap
+        
+        if is_token0:
+            # Get max amounts for both directions
+            token0_out_max, token1_in_max = self.compute_upward_swap_within_tick_boundaries()
+            token0_in_max, token1_out_max = self.compute_downward_swap_within_tick_boundaries()
+            
+            # Calculate effective prices
+            upward_effective_price = token0_in_max / token1_out_max if token1_out_max > 0 else 0
+            downward_effective_price = token0_out_max / token1_in_max if token1_in_max > 0 else 0
+            
+            # For selling token0 (upward swap)
+            upward_price_impact = ((upward_effective_price / current_market_price) - 1) * 10_000
+            # For buying token0 (downward swap) 
+            downward_price_impact = (1 - (downward_effective_price / current_market_price)) * 10_000
+            
+            return upward_price_impact if direction == 'sell' else downward_price_impact
+            
+        else:
+            # Same logic but reversed for token1
+            token0_out_max, token1_in_max = self.compute_upward_swap_within_tick_boundaries()
+            token0_in_max, token1_out_max = self.compute_downward_swap_within_tick_boundaries()
+            
+            upward_effective_price = token0_in_max / token1_out_max if token1_out_max > 0 else 0
+            downward_effective_price = token0_out_max / token1_in_max if token1_in_max > 0 else 0
+            
+            # For buying token1 (upward swap)
+            upward_price_impact = ((upward_effective_price / current_market_price) - 1) * 10_000
+            # For selling token1 (downward swap)
+            downward_price_impact = (1 - (downward_effective_price / current_market_price)) * 10_000
+            
+            return upward_price_impact if direction == 'buy' else downward_price_impact
+    
+    async def _compute_wrap_cost(self, asset: str) -> float:
+        """
+        Compute the wrap cost for a specific asset.
+        """
+        if asset != 'ETH':
+            return 0
+        
+        cost_info = await self.token_monitor.get_eth_wrap_gas()
+        cost_in_asset = cost_info['cost_wei'] / self.get_asset_decimals(asset)
+        return cost_in_asset
+    
+    async def _compute_unwrap_cost(self, asset: str) -> float:
+        """
+        Compute the unwrap cost for a specific asset.
+        """
+        if asset != 'WETH':
+            return 0
+        
+        cost_info = await self.token_monitor.get_eth_unwrap_gas()
+        cost_in_asset = cost_info['cost_wei'] / self.get_asset_decimals(asset)
+        return cost_in_asset
+    
+    async def _compute_transfer_cost(self, asset: str) -> float:
+        """
+        Compute the transfer cost for a specific asset.
+        """
+        cost_info = await self.token_monitor.get_token_transfer_gas(self.get_asset_address(asset))
+        cost_in_asset = cost_info['cost_wei'] / self.get_asset_decimals(asset)
+        return cost_in_asset
+    
+    async def _compute_pool_swap_gas_cost(self, asset: str) -> float:
+        """
+        Compute the pool swap gas cost for a specific asset.
+        """
+        cost_info = await self.token_monitor.get_v3_swap_gas(self.pool_address)
+        cost_in_asset = cost_info['cost_wei'] / self.get_asset_decimals(asset)
+        return cost_in_asset
+    
     async def compute_buy_and_transfer_costs(self, asset: str, amount: float) -> float:
         """
         Compute the buy and transfer costs for a specific asset.
+            Costs
+             1. Slippage cost
+             2. Pool fee (fixed)
+             3. Pool swap gas cost
+             4. Wrapping gas cost
+             5. Transfer gas cost
+        Args:
+            asset (str): The asset code (e.g., 'ETH')
+            amount (float): The amount of the buy order
+        Returns:
+            float: The execution costs in BPS
         """
-        return 0
+        # Calculate slippage and fee costs precisely
+        # First apply pool fee, then calculate slippage on remaining amount
+        fee_cost = amount * (self.metadata['pool_fee']/1_000_000)
+        amount_after_fee = amount - fee_cost
+        slippage_cost = await self._compute_slippage_cost(asset, amount_after_fee, 'buy') * amount_after_fee / 10_000
+
+        swap_gas_cost = await self._compute_pool_swap_gas_cost(asset)
+        execution_cost = fee_cost + slippage_cost + swap_gas_cost
+        
+        wrap_cost = await self._compute_wrap_cost(asset)
+        transfer_cost = await self._compute_transfer_cost(asset)
+        
+        logger.info(f'slippage_cost: {slippage_cost}, swap_gas_cost: {swap_gas_cost}, wrap_cost: {wrap_cost}, transfer_cost: {transfer_cost}')
+        total_cost = execution_cost + wrap_cost + transfer_cost
+        return total_cost / amount * 10_000
     
     async def compute_sell_costs(self, asset: str, amount: float) -> float:
         """
         Compute the sell costs for a specific asset.
+        Costs
+             1. Slippage cost
+             2. Pool fee (fixed)
+             3. Pool swap gas cost
+             4. Unwrapping gas cost
         """
-        return 0
+        # Calculate slippage and fee costs precisely
+        # First apply pool fee, then calculate slippage on remaining amount
+        fee_cost = amount * (self.metadata['pool_fee']/1_000_000)
+        amount_after_fee = amount - fee_cost
+        slippage_cost = await self._compute_slippage_cost(asset, amount_after_fee, 'sell') * amount_after_fee / 10_000
+
+        swap_gas_cost = await self._compute_pool_swap_gas_cost(asset)
+        execution_cost = fee_cost + slippage_cost + swap_gas_cost
+        
+        unwrap_cost = await self._compute_unwrap_cost(asset)
+        logger.info(f'slippage_cost: {slippage_cost}, swap_gas_cost: {swap_gas_cost}, unwrap_cost: {unwrap_cost}')
+        return execution_cost + unwrap_cost
+    
+    async def get_max_executible_size(self, asset: str, direction: str) -> float:
+        """
+        Get the maximum size that can be executed for a specific asset and direction without crossing the tick boundaries.
+        """
+        # For upward price movement (selling token1, buying token0)
+        token0_out_max, token1_in_max = self.compute_upward_swap_within_tick_boundaries()
+
+        # For downward price movement (selling token1, buying token0)
+        token0_in_max, token1_out_max = self.compute_downward_swap_within_tick_boundaries()
+
+        if self.metadata['token0'].symbol == asset and direction == 'buy':
+            return token0_in_max
+        elif self.metadata['token0'].symbol == asset and direction == 'sell':
+            return token0_out_max
+        elif self.metadata['token1'].symbol == asset and direction == 'buy':
+            return token1_in_max
+        elif self.metadata['token1'].symbol == asset and direction == 'sell':
+            return token1_out_max
+        else:
+            raise ValueError(f"Unsupported asset: {asset} and direction: {direction}")
+    
+    async def get_base_asset_price(self) -> float:
+        """
+        Get the current price of the base asset.
+        """
+        return await self.get_current_price(self.base_asset)
+    
+    async def get_base_asset_deposit_address(self) -> str:
+        """
+        Get the deposit address for the base asset.
+        """
+        return await self.get_deposit_address(self.base_asset)
+    
+    async def get_base_asset_balance(self) -> float:
+        """
+        Get the current balance of the base asset.
+        """
+        return await self.get_balance(self.base_asset)
+    
+    async def wrap_asset(self, asset: str, amount: float) -> float:
+        """
+        Wrap the asset.
+        """
+        if asset != 'ETH':
+            logger.warning(f"Asset {asset} does not need to be wrapped")
+            return amount
+        
+        # Get the wrapped asset symbol
+        wrapped_asset = 'WETH'
+        logger.info(f"Wrapping {amount} {asset} to {wrapped_asset}")
+
+        # Convert amount to wei
+        amount_wei = await self.async_w3.to_wei(amount, 'ether')
+
+        try:
+            # Build the deposit transaction
+            contract = self.async_w3.eth.contract(address=self.get_asset_address(wrapped_asset), abi=self.ERC20_ABI)
+            tx = contract.functions.deposit().build_transaction({
+                'chainId': await self.async_w3.eth.chain_id,
+                'gas': 100000,  # Standard gas limit for wrapping
+                'maxPriorityFeePerGas': await self.web3.eth.max_priority_fee,
+                'maxFeePerGas': await self.web3.eth.gas_price,
+                'nonce': await self.web3.eth.get_transaction_count(self.wallet_address),
+                'value': amount_wei,  # Amount to wrap in wei
+            })
+
+            # Sign and send the transaction
+            signed_tx = self.web3.eth.account.sign_transaction(tx, self.wallet_private_key)
+            tx_hash = await self.web3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            
+            # Wait for transaction receipt
+            tx_receipt = await self.web3.eth.wait_for_transaction_receipt(tx_hash)
+            
+            if tx_receipt['status'] == 1:
+                logger.info(f"Successfully wrapped {amount} {asset} to {wrapped_asset}")
+                logger.info(f"Transaction hash: {tx_hash.hex()}")
+                return tx_receipt['value'] / self.get_asset_decimals(wrapped_asset)
+            else:
+                logger.error(f"Failed to wrap {asset}. Transaction reverted.")
+                return 0
+
+        except Exception as e:
+            logger.error(f"Error wrapping {asset}: {str(e)}")
+            logger.error(traceback.format_exc())
+            return 0
+    
+    async def unwrap_asset(self, asset: str, amount: float) -> float:
+        """
+        Unwrap the asset.
+        """
+        if asset != 'WETH':
+            logger.warning(f"Asset {asset} does not need to be unwrapped")
+            return amount
+        
+        unwrapped_asset = 'ETH'
+        logger.info(f"Unwrapping {amount} {asset} to {unwrapped_asset}")
+        
+        # Convert amount to wei
+        amount_wei = await self.async_w3.to_wei(amount, 'ether')
+
+        try:
+            # Build the unwrap transaction
+            contract = self.async_w3.eth.contract(address=self.get_asset_address(asset), abi=self.ERC20_ABI)
+            tx = contract.functions.withdraw(amount_wei).build_transaction({
+                'chainId': await self.async_w3.eth.chain_id,
+                'gas': 100000,  # Standard gas limit for unwrapping
+            })
+
+            # Sign and send the transaction
+            signed_tx = self.async_w3.eth.account.sign_transaction(tx, self.wallet_private_key)
+            tx_hash = await self.async_w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            
+            # Wait for transaction receipt
+            tx_receipt = await self.async_w3.eth.wait_for_transaction_receipt(tx_hash)
+            
+            if tx_receipt['status'] == 1:
+                logger.info(f"Successfully unwrapped {amount} {asset} to {unwrapped_asset}")
+                return tx_receipt['value'] / self.get_asset_decimals(unwrapped_asset)
+            else:
+                logger.error(f"Failed to unwrap {asset}. Transaction reverted.")
+                return 0
+
+        except Exception as e:
+            logger.error(f"Error unwrapping {asset}: {str(e)}")
+            logger.error(traceback.format_exc())
+            return 0
 
 async def main():
     """
@@ -862,9 +1129,11 @@ async def main():
         infura_ws_url = config.infura_ws_url
         pool_address = config.instrument_config[0]['pool_address']  
         private_key = config.wallet_private_key
-        
+        base_asset = config.instrument_config[0]['base_asset']
+        quote_asset = config.instrument_config[0]['quote_asset']
+
         # Initialize the connector
-        uniswap = Uniswap(infura_url, infura_ws_url, pool_address, private_key)
+        uniswap = Uniswap(infura_url, infura_ws_url, pool_address, private_key, base_asset, quote_asset)
         await uniswap.init()
         logger.info(f"Pool contains {uniswap.metadata['token0'].symbol} and {uniswap.metadata['token1'].symbol}")
         

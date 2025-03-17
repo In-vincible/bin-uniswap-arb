@@ -33,26 +33,29 @@ class ArbitrageStrategy(BaseStrategy):
         self.instrument_config = config.instrument_config[0]
         self.arb_config = config.arb_config
         
-        # Set up trading parameters
+        # Set up instrument parameters
         self.binance_instrument = self.instrument_config['binance_instrument']
         self.uniswap_instrument = self.instrument_config['uniswap_instrument']
-        self.base_token = self.instrument_config['base_token']
-        self.quote_token = self.instrument_config['quote_token']
-        self.base_token_address = self.instrument_config['base_token_address']
-        self.quote_token_address = self.instrument_config['quote_token_address']
-        
+
         # Initialize exchange connections
         self.binance = Binance(
             config.binance_api_key,
             config.binance_api_secret,
-            self.instrument_config['binance_instrument']
+            self.instrument_config['binance_instrument'],
+            self.instrument_config['binance_base_asset'],
+            self.instrument_config['binance_quote_asset']
         )
         self.uniswap = Uniswap(
             config.infura_url,
             config.infura_ws_url,
             self.instrument_config['pool_address'],
-            config.wallet_private_key
+            config.wallet_private_key,
+            self.instrument_config['uniswap_base_asset'],
+            self.instrument_config['uniswap_quote_asset']
         )
+        
+        # Create event loop for sync methods
+        self._loop = None
     
     async def initialize(self) -> None:
         """
@@ -65,6 +68,12 @@ class ArbitrageStrategy(BaseStrategy):
         await self.binance.init()
         await self.uniswap.init()
     
+    def initialize_sync(self) -> None:
+        """
+        Synchronous wrapper for initialize method.
+        """
+        self._get_or_create_loop().run_until_complete(self.initialize())
+    
     async def analyze(self) -> Dict[str, Any]:
         """
         Fetch current prices from both exchanges and analyze for arbitrage opportunities.
@@ -72,8 +81,8 @@ class ArbitrageStrategy(BaseStrategy):
         Returns:
             Dictionary containing analysis results including prices and initial signals
         """
-        binance_price = await self.binance.get_current_price(self.base_token)
-        uniswap_price = await self.uniswap.get_current_price(self.base_token)
+        binance_price = await self.binance.get_base_asset_price()
+        uniswap_price = await self.uniswap.get_base_asset_price()
         
         self.logger.info(f"Binance price: {binance_price}, Uniswap price: {uniswap_price}")
         
@@ -92,6 +101,7 @@ class ArbitrageStrategy(BaseStrategy):
         
         # Preliminary check based on execution mode and price dislocation
         basic_opportunity = self.is_price_dislocated(uniswap_price, binance_price)
+        arb_size = await self.compute_arb_size(uniswap_price, binance_price, uniswap_trade_direction)
         
         return {
             "binance_price": binance_price,
@@ -99,59 +109,77 @@ class ArbitrageStrategy(BaseStrategy):
             "price_dislocation_bps": round(price_difference, 2),
             "uniswap_trade_direction": uniswap_trade_direction,
             "basic_opportunity": basic_opportunity,
-            "should_execute": False  # Will be set to True after validation if opportunity is valid
+            "should_execute": False,  # Will be set to True after validation if opportunity is valid
+            "arb_size": arb_size
         }
     
-    async def validate_opportunity(self, analysis_result: Dict[str, Any]) -> bool:
+    def analyze_sync(self) -> Dict[str, Any]:
         """
-        Validate a potential arbitrage opportunity through multiple checks.
-        
-        Args:
-            analysis_result: Output from the analyze method containing prices
-                            and initial opportunity assessment
-                            
-        Returns:
-            Boolean indicating whether the opportunity is valid and profitable
+        Synchronous wrapper for analyze method.
         """
-        # Skip validation if basic opportunity check failed
-        if not analysis_result.get("basic_opportunity", False):
+        return self._get_or_create_loop().run_until_complete(self.analyze())
+    
+    async def run_pre_validations(self, analysis_result: Dict[str, Any]) -> bool:
+        """
+        Run pre-validation checks for the opportunity.
+        """
+        # Check for capital availability in buy exchange
+        buy_exchange = self.uniswap if analysis_result["uniswap_trade_direction"] == "buy" else self.binance
+        expected_balance = analysis_result["arb_size"] * await buy_exchange.get_base_asset_price()
+        if await buy_exchange.get_balance(buy_exchange.quote_asset) < expected_balance:
+            self.logger.info(f"Insufficient balance in {buy_exchange.quote_asset} on {buy_exchange.__class__.__name__}")
+            return False
+
+        # Preliminary checks for transfers and network conditions/block congestions
+        if not await self.binance.pre_validate_transfers(self.binance.base_asset, analysis_result["arb_size"]):
+            self.logger.info("Binance transfer validation failed")
             return False
         
-        uniswap_price = analysis_result["uniswap_price"]
-        binance_price = analysis_result["binance_price"]
-        uniswap_trade_direction = analysis_result["uniswap_trade_direction"]
-        
-        # Calculate optimal arbitrage size
-        arb_size = await self.compute_arb_size(uniswap_price, binance_price, uniswap_trade_direction)
-        if arb_size == 0:
-            self.logger.info("No arbitrage size found")
+        if not await self.uniswap.pre_validate_transfers(self.uniswap.base_asset, analysis_result["arb_size"]):
+            self.logger.info("Uniswap transfer validation failed")
             return False
-        
-        # Store arb_size in analysis result for later use in execute
-        analysis_result["arb_size"] = arb_size
-        
-        # Validate network conditions, gas costs, and slippage
-        expected_profit = arb_size * abs(uniswap_price - binance_price)
-        analysis_result["expected_profit"] = expected_profit
-        
-        if not await self._validate_network_congestion_gas_costs_and_possible_slippage(
-            arb_size, uniswap_trade_direction, expected_profit
-        ):
-            self.logger.info("Gas costs or slippage validation failed")
-            return False
-        
-        # Verify Binance transfer availability
-        if not await self._verify_binance_transfer_open(uniswap_price, binance_price):
-            self.logger.info("Binance transfer check failed")
-            return False
-        
-        # Simulate the transaction
-        if not await self._simulate_transaction(arb_size, uniswap_trade_direction, expected_profit):
-            self.logger.info("Transaction simulation validation failed")
-            return False
-        
-        # If all validations pass, this is a valid opportunity
+            
         return True
+    
+    def run_pre_validations_sync(self, analysis_result: Dict[str, Any]) -> bool:
+        """
+        Synchronous wrapper for run_pre_validations method.
+        """
+        return self._get_or_create_loop().run_until_complete(self.run_pre_validations(analysis_result))
+    
+    async def verify_profitability_against_costs(self, analysis_result: Dict[str, Any]) -> bool:
+        """
+        Verify profitability against costs.
+        """
+        buy_exchange = self.uniswap if analysis_result["uniswap_trade_direction"] == "buy" else self.binance
+        sell_exchange = self.binance if analysis_result["uniswap_trade_direction"] == "buy" else self.uniswap
+
+        # Calculate buy costs and resulting size after fees
+        buy_costs_bps = await buy_exchange.compute_buy_and_transfer_costs(buy_exchange.base_asset, analysis_result["arb_size"])
+        buy_and_transfer_costs = analysis_result["arb_size"] * (buy_costs_bps / 10000)
+        size_after_buy = analysis_result["arb_size"] * (1 - (buy_costs_bps / 10000))
+        
+        # Calculate sell costs on remaining size
+        sell_costs_bps = await sell_exchange.compute_sell_costs(sell_exchange.base_asset, size_after_buy)
+        sell_costs = size_after_buy * (sell_costs_bps / 10000)
+        
+        # Calculate final profit in bps after all costs
+        buy_accrued = buy_exchange.get_base_asset_price() * analysis_result["arb_size"]
+        sell_accrued = sell_exchange.get_base_asset_price() * size_after_buy
+        profit = sell_accrued - buy_accrued - buy_and_transfer_costs - sell_costs
+        self.logger.info(f"Final expected profit: {profit}")
+
+        if profit/analysis_result["arb_size"] < self.arb_config["min_profit_bps"] / 10_000:
+            self.logger.info(f"Profit is too low: {profit/analysis_result['arb_size']}")
+            return False    
+
+        return True
+    
+    def verify_profitability_against_costs_sync(self, analysis_result: Dict[str, Any]) -> bool:
+        """
+        Synchronous wrapper for verify_profitability_against_costs method.
+        """
+        return self._get_or_create_loop().run_until_complete(self.verify_profitability_against_costs(analysis_result))
     
     async def execute(self, analysis_result: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -189,6 +217,12 @@ class ArbitrageStrategy(BaseStrategy):
             "execution_details": execution_result
         }
     
+    def execute_sync(self, analysis_result: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Synchronous wrapper for execute method.
+        """
+        return self._get_or_create_loop().run_until_complete(self.execute(analysis_result))
+    
     async def get_state(self) -> Dict[str, Any]:
         """
         Get the current state of the arbitrage strategy.
@@ -210,16 +244,11 @@ class ArbitrageStrategy(BaseStrategy):
             "uniswap_state": uniswap_state
         }
     
-    async def cleanup(self) -> None:
+    def get_state_sync(self) -> Dict[str, Any]:
         """
-        Clean up resources before stopping the strategy.
-        
-        Returns:
-            None
+        Synchronous wrapper for get_state method.
         """
-        self.logger.info("Cleaning up arbitrage strategy resources")
-        await ExecutionEngine.rollback_trades_and_transfers(self.binance, self.uniswap, self.base_token, self.arb_config['min_rollback_order_size'])
-    
+        return self._get_or_create_loop().run_until_complete(self.get_state())
     
     def is_price_dislocated(self, uniswap_price: float, binance_price: float) -> bool:
         """
@@ -257,15 +286,15 @@ class ArbitrageStrategy(BaseStrategy):
             Float representing the optimal size for the arbitrage
         """
         binance_trade_direction = 'buy' if uniswap_trade_direction == 'sell' else 'sell'
-        binance_tob_size = await self.binance.get_tob_size(self.binance_instrument, binance_trade_direction)
-        uniswap_tob_size = await self.uniswap.get_tob_size(uniswap_trade_direction)
+        theoretical_binance_max_executible_size = await self.binance.get_max_executible_size(self.binance_instrument, binance_trade_direction)
+        theoretical_uniswap_max_executible_size = await self.uniswap.get_max_executible_size(self.uniswap_instrument, uniswap_trade_direction)
         
-        self.logger.info(f"Binance TOB size: {binance_tob_size}, Uniswap TOB size: {uniswap_tob_size}")
-        
-        exchange_size = min(binance_tob_size, uniswap_tob_size)
-        arb_size = min(exchange_size, self.arb_config['order_size_limit'])
-        
-        return arb_size
+        self.logger.info(f"Binance max executible size: {theoretical_binance_max_executible_size}, Uniswap max executible size: {theoretical_uniswap_max_executible_size}")
+        theoretical_arb_size = min(theoretical_binance_max_executible_size, theoretical_uniswap_max_executible_size)
+        scaled_arb_size = theoretical_arb_size * self.arb_config['size_scale_factor']
+        final_arb_size = min(scaled_arb_size, self.arb_config['order_size_limit'])
+        self.logger.info(f"Computed arb size: {final_arb_size}")
+        return final_arb_size
     
     def _uniswap_trade_direction(self, uniswap_price: float, binance_price: float) -> str:
         """
@@ -282,76 +311,6 @@ class ArbitrageStrategy(BaseStrategy):
             return 'sell'
         else:
             return 'buy'
-    
-    def _binance_transfer_direction(self, uniswap_price: float, binance_price: float) -> str:
-        """
-        Determine the direction of token transfer on Binance based on price comparison.
-        
-        Args:
-            uniswap_price: Current price on Uniswap
-            binance_price: Current price on Binance
-            
-        Returns:
-            String representing transfer direction ('deposit' or 'withdraw')
-        """
-        if uniswap_price > binance_price:
-            return 'deposit'
-        else:
-            return 'withdraw'
-    
-    async def _verify_binance_transfer_open(self, uniswap_price: float, binance_price: float) -> bool:
-        """
-        Verify that token transfer is open on Binance for the trade direction.
-        
-        Args:
-            uniswap_price: Current price on Uniswap
-            binance_price: Current price on Binance
-            
-        Returns:
-            Boolean indicating whether token transfer is open
-        """
-        transfer_direction = self._binance_transfer_direction(uniswap_price, binance_price)
-        if transfer_direction == 'deposit':
-            return await self.binance.verify_deposit_open(self.base_token)
-        else:
-            return await self.binance.verify_withdrawal_open(self.base_token)
-    
-    async def _validate_network_congestion_gas_costs_and_possible_slippage(
-        self, arb_size: float, uniswap_trade_direction: str, expected_profit: float
-    ) -> bool:
-        """
-        Validate network conditions for trade execution.
-        
-        Args:
-            arb_size: Size of the arbitrage trade
-            uniswap_trade_direction: Direction of trade on Uniswap
-            expected_profit: Expected profit from the trade
-            
-        Returns:
-            Boolean indicating whether network conditions are favorable
-        """
-        # In the original implementation, this is a placeholder
-        # In a real implementation, this would check gas prices, network congestion, etc.
-        return True
-    
-    async def _simulate_transaction(
-        self, arb_size: float, uniswap_trade_direction: str, expected_profit: float
-    ) -> bool:
-        """
-        Simulate the transaction to verify profitability after costs.
-        
-        Args:
-            arb_size: Size of the arbitrage trade
-            uniswap_trade_direction: Direction of trade on Uniswap
-            expected_profit: Expected profit from the trade
-            
-        Returns:
-            Boolean indicating whether the simulated transaction is profitable
-        """
-        # In the original implementation, this is a placeholder
-        # In a real implementation, this would use a service like Blocknative
-        # to simulate the transaction and verify profitability
-        return True
     
     async def get_arb_parameters(self, uniswap_price: float, binance_price: float) -> Dict[str, Any]:
         """
@@ -384,6 +343,43 @@ class ArbitrageStrategy(BaseStrategy):
                 'min_rollback_size': self.arb_config['min_rollback_order_size']
             }
 
+    async def cleanup(self) -> None:
+        """
+        Clean up resources before stopping the strategy.
+        
+        Returns:
+            None
+        """
+        self.logger.info("Cleaning up arbitrage strategy resources")
+        await ExecutionEngine.rollback_trades_and_transfers(self.binance, self.uniswap, self.base_token, self.arb_config['min_rollback_order_size'])
+    
+    def cleanup_sync(self) -> None:
+        """
+        Synchronous wrapper for cleanup method.
+        """
+        return self._get_or_create_loop().run_until_complete(self.cleanup())
+    
+    def _get_or_create_loop(self) -> asyncio.AbstractEventLoop:
+        """
+        Get the existing event loop or create a new one.
+        
+        This helper method ensures we have a valid event loop to run 
+        coroutines from synchronous methods.
+        
+        Returns:
+            Event loop instance
+        """
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                raise RuntimeError("Event loop is closed")
+            return loop
+        except RuntimeError:
+            # Create new event loop if current one is closed or doesn't exist
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._loop = loop
+            return loop
 
 # Example usage
 async def main():

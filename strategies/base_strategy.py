@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+import time
 from typing import Dict, Any, Optional, List, Union
 from config import Config
 import logging
@@ -51,6 +52,18 @@ class BaseStrategy(ABC):
         """
         raise NotImplementedError("Strategy subclass must implement analyze method")
     
+    async def run_pre_validations(self, analysis_result: Dict[str, Any]) -> bool:
+        """
+        Run pre-validation checks for the opportunity.
+        """
+        raise NotImplementedError("Strategy subclass must implement run_pre_validations method")
+    
+    async def verify_profitability_against_costs(self, analysis_result: Dict[str, Any]) -> bool:
+        """
+        Verify profitability against costs.
+        """
+        raise NotImplementedError("Strategy subclass must implement verify_profitability_against_costs method")
+    
     async def validate_opportunity(self, analysis_result: Dict[str, Any]) -> bool:
         """
         Validate a potential trading opportunity identified in the analysis step.
@@ -65,8 +78,16 @@ class BaseStrategy(ABC):
         Returns:
             Boolean indicating whether the opportunity is valid and should be executed
         """
-        # Default implementation considers all opportunities valid
-        return analysis_result.get("should_execute", False)
+        if not analysis_result.get("basic_opportunity", False):
+            return False
+        
+        if not await self.run_pre_validations(analysis_result):
+            return False
+        
+        if not await self.verify_profitability_against_costs(analysis_result):
+            return False
+        
+        return True
         
     @abstractmethod
     async def execute(self, analysis_result: Dict[str, Any]) -> Dict[str, Any]:
@@ -96,16 +117,21 @@ class BaseStrategy(ABC):
             Dictionary containing the results of strategy execution
         """
         self.logger.debug("Running strategy iteration")
+        s_time = time.time()
         analysis_result = await self.analyze()
-        
+        self.logger.info(f"Analysis time: {(time.time() - s_time) * 1_000_000} microseconds")
+        s_time = time.time()
         # Validate the opportunity before execution
         should_execute = await self.validate_opportunity(analysis_result)
+        self.logger.info(f"Validation time: {(time.time() - s_time) * 1_000_000} microseconds")
+        s_time = time.time()
         analysis_result["should_execute"] = should_execute
         
         # Only execute if validation passed
         if should_execute:
             self.logger.info("Valid trading opportunity found, executing")
             execution_result = await self.execute(analysis_result)
+            self.logger.info(f"Execution time: {(time.time() - s_time) * 1_000_000} microseconds")
             return {
                 "analysis": analysis_result,
                 "execution": execution_result
