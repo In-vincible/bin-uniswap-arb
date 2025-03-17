@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 import time
 import traceback
 from typing import Any, Dict
@@ -178,6 +179,21 @@ class Binance(BaseExchange):
         return self.market_data
 
     async def place_order(self, symbol: str, side: str, order_type: str, quantity, price=None):
+        """
+        Place an order on Binance.
+        """
+        # Round quantity according to the asset's precision to avoid Binance API errors
+        if symbol != self.metadata['symbol']:
+            raise ValueError(f"Symbol {symbol} not found in metadata")
+        
+        # Get the quantity precision from the metadata
+        lot_size_filter = next(filter(lambda x: x['filterType'] == 'LOT_SIZE', self.metadata['filters']))
+        step_size = float(lot_size_filter['stepSize'])
+        precision = len(str(step_size).split('.')[-1].rstrip('0'))
+        
+        # Round down to the correct precision
+        quantity = math.floor(quantity * (10 ** precision)) / (10 ** precision)
+
         if order_type.upper() == "MARKET":
             order = await self.client.create_order(
                 symbol=symbol,
@@ -211,10 +227,10 @@ class Binance(BaseExchange):
         Raises:
             Exception: If the API call fails or the asset is not supported
         """
-        return self.deposit_addresses[asset]
+        return self.deposit_addresses[asset]['address']
 
     async def withdraw(self, asset: str, address: str, amount, network: str = "ETH"):
-        params = {"asset": asset, "address": address, "amount": amount}
+        params = {"coin": asset, "address": address, "amount": amount}
         if network:
             params["network"] = network
         return await self.client.withdraw(**params)
@@ -237,7 +253,7 @@ class Binance(BaseExchange):
         Retrieves the account balances for the specified assets.
         Returns a dictionary mapping each asset to its free and locked balances.
         """
-        if live:
+        if live or len(self.balances) == 0:
             return await self._update_balance_cache()
         else:
             return self.balances
@@ -315,10 +331,10 @@ class Binance(BaseExchange):
         except Exception as e:
             logger.error(f"Failed to execute trade: {str(e)}")
             return {
-                'status': 'error',
-                'error': str(e),
-                'trade_size': 0
-            }
+                    'status': 'error',
+                    'error': str(e),
+                    'trade_size': 0
+                }
 
     async def confirm_trade(self, trade):
         """
@@ -348,14 +364,21 @@ class Binance(BaseExchange):
         balances = await self.get_balances(live=live)
         return float(balances[symbol])
     
-    async def confirm_deposit(self, asset: str, amount: float, tolerance: float = 1e-6) -> float:
+    async def confirm_deposit(self, asset: str, amount: float, tolerance: float = 1e-6, timeout_seconds: int = 120) -> float:
         """
         Confirm that a deposit was completed and return the confirmed size.
         """
-        deposit_history = await self.get_deposit_history(asset)
-        for deposit in deposit_history:
-            if abs(float(deposit['amount']) - amount) <= tolerance:
-                return float(deposit['amount'])
+        logger.info(f"Confirming deposit for {asset} {amount}")
+
+        start_time = time.time()
+        while True:
+            deposit_history = await self.get_deposit_history(asset)
+            for deposit in deposit_history:
+                if deposit['amount'] - amount <= tolerance:
+                    return deposit['amount']
+            await asyncio.sleep(2)
+            if time.time() - start_time > timeout_seconds:
+                return 0
         return 0
     
     async def confirm_withdrawal(self, withdrawal_info: Dict[str, Any]):
@@ -369,7 +392,7 @@ class Binance(BaseExchange):
                 return withdrawal['amount']
             elif withdrawal['status'] == 3:
                 return 0
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(2)
     
     async def pre_validate_transfers(self, asset: str, amount: float, max_transfer_time_seconds: int = 10) -> bool:
         """
@@ -399,15 +422,20 @@ class Binance(BaseExchange):
         Returns:
             float: The execution costs in BPS
         """
-        # First calculate how much we'll receive after paying taker fee
-        post_execution_amount = amount * (1 - (self.taker_fee_bps / 10000))  # Convert bps to decimal
-        
-        # Then calculate how much we'll have after withdrawal fee
+        slippage_bps = (await self.get_current_price(self.instrument) - self.market_data[self.instrument]['best_ask']) / self.market_data[self.instrument]['best_ask'] * 10_000
+        slippage_cost = slippage_bps * amount / 10_000
+        post_execution_amount = amount - slippage_cost
+
+        # apply taker fee post execution
+        taker_fee_cost = post_execution_amount * (self.taker_fee_bps / 10000)
+        post_execution_amount = post_execution_amount - taker_fee_cost
+
+        # apply withdrawal fee
         withdrawal_fee = await self.get_withdrawal_fee(asset)
         final_amount = post_execution_amount - withdrawal_fee
         
-        # Return total cost in bps
-        total_cost_bps = (1 - final_amount / amount) * 10000
+        logger.info(f"slippage_bps: {slippage_bps}, toker_fee_bps: {self.taker_fee_bps}, withdrawal_fee: {withdrawal_fee}")
+        total_cost_bps = (1 - final_amount / amount) * 10_000
         return total_cost_bps
     
     async def compute_sell_costs(self, asset: str, amount: float) -> float:
@@ -421,7 +449,16 @@ class Binance(BaseExchange):
         Returns:
             float: The execution costs in BPS
         """
-        return self.taker_fee_bps
+        # For binance fee applies post execution
+        ideal_sell_accrual = await self.get_current_price(self.instrument) * amount
+        real_sell_accrual = self.market_data[self.instrument]['best_bid'] * amount
+        slippage_cost_in_quote_asset = real_sell_accrual - ideal_sell_accrual
+
+        fee_cost_in_quote_asset = real_sell_accrual * self.taker_fee_bps / 10_000
+        total_cost_in_quote_asset = slippage_cost_in_quote_asset + fee_cost_in_quote_asset
+        total_cost_bps = (total_cost_in_quote_asset / ideal_sell_accrual) * 10_000
+        
+        return total_cost_bps
     
     async def get_base_asset_price(self) -> float:
         """
@@ -435,11 +472,11 @@ class Binance(BaseExchange):
         """
         return await self.get_deposit_address(self.base_asset)
     
-    async def get_base_asset_balance(self) -> float:
+    async def get_base_asset_balance(self, live=False) -> float:
         """
         Get the current balance of the base asset.
         """
-        return await self.get_balance(self.base_asset)
+        return await self.get_balance(self.base_asset, live=live)
     
     async def wrap_asset(self, asset: str, amount: float) -> float:
         """
@@ -457,7 +494,6 @@ class Binance(BaseExchange):
 async def main():
     config = Config()
     instrument = "ETHUSDC"
-    asset_list = ["ETH", "USDC"]
     base_asset = "ETH"
     quote_asset = "USDC"
     connector = Binance(config.binance_api_key, config.binance_api_secret, instrument, base_asset, quote_asset)
@@ -475,24 +511,54 @@ async def main():
     all_prices = connector.get_all_prices()
     logger.info(f"All prices: {all_prices}")
 
-    # Example: Place a market buy order for ETHUSDC (0.001 quantity)
-    try:
-        trade_response = await connector.place_order(
-            symbol="ETHUSDC",
-            side="BUY",
-            order_type="MARKET",
-            quantity=0.001
-        )
-        logger.info(f'Trade Order Response: {trade_response}')
-    except Exception as e:
-        logger.info(f"Error placing order: {e}")
+    # Example: Get deposit address
+    deposit_address = await connector.get_deposit_address("ETH")
+    logger.info(f"Deposit address: {deposit_address}")
 
-    # Example: Get deposit address for USDT
-    try:
-        deposit_addr = await connector.get_deposit_address(asset="ETH")
-        logger.info(f"ETH Deposit Address: {deposit_addr}")
-    except Exception as e:
-        logger.info(f"Error fetching deposit address: {e}")
+    # Example: Place a market buy order for ETHUSDC (0.005 quantity)
+    test_trade = False
+    if test_trade:
+        try:
+            trade_response = await connector.place_order(
+                symbol="ETHUSDC",
+                side="BUY",
+                order_type="MARKET",
+                quantity=0.005
+            )
+            logger.info(f'Trade Order Response: {trade_response}')
+
+            # Wait for the order to be filled
+            await asyncio.sleep(1)
+
+            # Get the order status
+            ETH_BALANCE = await connector.get_balance(connector.base_asset, live=True)
+            logger.info(f"ETH Balance: {ETH_BALANCE}")
+
+            # Sell the ETH
+            sell_response = await connector.place_order(
+                symbol="ETHUSDC",
+                side="SELL",
+                order_type="MARKET",
+                quantity=ETH_BALANCE
+            )
+            logger.info(f'Sell Order Response: {sell_response}')
+
+        except Exception as e:
+            logger.info(f"Error placing order: {e}")
+
+    # Test withdrawals
+    test_withdrawals = False
+    if test_withdrawals:
+        try:
+            # Get deposit address for USDT
+            address = "0x94A5d421375c9486061f6835a11c81196470290C"
+            amount = ETH_BALANCE
+            withdrawal_response = await connector.withdraw(asset="ETH", address=address, amount=amount)
+            logger.info(f"Withdrawal Response: {withdrawal_response}")
+        except Exception as e:
+            logger.error(traceback.format_exc())
+            logger.info(f"Error withdrawing: {e}")
+
 
     # Example: Get deposit history for USDT
     try:
@@ -551,9 +617,9 @@ async def main():
     
     # Example: Confirm deposit
     try:
-        deposit_asset = "ETH"
-        deposit_amount = 0.002
-        confirmed_deposit = await connector.confirm_deposit(deposit_asset, deposit_amount)
+        asset = "ETH"
+        amount = 0.002
+        confirmed_deposit = await connector.confirm_deposit(asset, amount)
         logger.info(f"Confirmed deposit: {confirmed_deposit}")
     except Exception as e:
         logger.info(f"Error confirming deposit: {e}")

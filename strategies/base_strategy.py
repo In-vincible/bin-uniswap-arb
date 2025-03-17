@@ -82,9 +82,11 @@ class BaseStrategy(ABC):
             return False
         
         if not await self.run_pre_validations(analysis_result):
+            self.logger.info("Pre-validation checks failed")
             return False
         
         if not await self.verify_profitability_against_costs(analysis_result):
+            self.logger.info("Profitability verification failed")
             return False
         
         return True
@@ -201,8 +203,9 @@ class BaseStrategy(ABC):
         if not self.is_running:
             self.logger.warning("Strategy is not running")
             return
-            
+        
         self.is_running = False
+        await self.cleanup()
         
         # Cancel the monitoring task if it exists
         if self.monitoring_task and not self.monitoring_task.done():
@@ -213,20 +216,6 @@ class BaseStrategy(ABC):
                 pass
             
         self.logger.info("Strategy stopped")
-    
-    @abstractmethod
-    async def get_state(self) -> Dict[str, Any]:
-        """
-        Get the current state of the strategy.
-        
-        This method should return a comprehensive view of the strategy's
-        internal state, which can be used for monitoring, debugging,
-        or state restoration.
-        
-        Returns:
-            Dictionary containing the current state of the strategy
-        """
-        raise NotImplementedError("Strategy subclass must implement get_state method")
         
     async def cleanup(self) -> None:
         """
