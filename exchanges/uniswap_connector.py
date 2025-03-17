@@ -671,7 +671,7 @@ class Uniswap(BaseExchange):
         """
         try:
             # Get transaction receipt
-            tx_receipt = await self.async_w3.eth.wait_for_transaction_receipt(tx_hash, timeout=240)
+            tx_receipt = await self.async_w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
             logger.info(f"[Confirm trade] Tx receipt status: {tx_receipt.status}")
             
             if tx_receipt.status != 1:
@@ -861,7 +861,7 @@ class Uniswap(BaseExchange):
         if withdrawal_info['status'] == 'error':
             return 0
         
-        tx_receipt = await self.async_w3.eth.wait_for_transaction_receipt(withdrawal_info['tx_hash'], timeout=240)
+        tx_receipt = await self.async_w3.eth.wait_for_transaction_receipt(withdrawal_info['tx_hash'], timeout=300)
         logger.info(f"Transaction receipt: {tx_receipt}")
         
         if tx_receipt and tx_receipt.get('status') == 1:
@@ -1138,7 +1138,7 @@ class Uniswap(BaseExchange):
                 
                 # Wait for approval
                 logger.info(f"Waiting for approval transaction {approve_tx_hash.hex()} to be confirmed...")
-                tx_receipt = await self.async_w3.eth.wait_for_transaction_receipt(approve_tx_hash, timeout=240)
+                tx_receipt = await self.async_w3.eth.wait_for_transaction_receipt(approve_tx_hash, timeout=300)
                 logger.info(f"tx_receipt: {tx_receipt}")
             
             # Convert deadline from seconds to timestamp
@@ -1454,7 +1454,7 @@ class Uniswap(BaseExchange):
             tx_hash = await self.async_w3.eth.send_raw_transaction(signed_tx.raw_transaction)
             
             # Wait for transaction receipt
-            tx_receipt = await self.async_w3.eth.wait_for_transaction_receipt(tx_hash, timeout=240)
+            tx_receipt = await self.async_w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
             
             if tx_receipt['status'] == 1:
                 # Get amount from the Deposit event logs
@@ -1512,7 +1512,7 @@ class Uniswap(BaseExchange):
             tx_hash = await self.async_w3.eth.send_raw_transaction(signed_tx.raw_transaction)
             
             # Wait for transaction receipt
-            tx_receipt = await self.async_w3.eth.wait_for_transaction_receipt(tx_hash, timeout=240)
+            tx_receipt = await self.async_w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)
             
             if tx_receipt['status'] == 1:
                 logger.info(f"Successfully unwrapped {amount} {asset} to {unwrapped_asset}")
