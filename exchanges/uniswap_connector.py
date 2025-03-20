@@ -73,7 +73,10 @@ class Uniswap(BaseExchange):
 
         # Swap Router ABI
         {"constant": True, "inputs": [{"name": "_owner", "type": "address"}, {"name": "_spender", "type": "address"}], "name": "allowance", "outputs": [{"name": "remaining", "type": "uint256"}], "payable": False, "stateMutability": "view", "type": "function"},
-        {"constant": False, "inputs": [{"name": "_spender", "type": "address"}, {"name": "_value", "type": "uint256"}], "name": "approve", "outputs": [{"name": "success", "type": "bool"}], "payable": False, "stateMutability": "nonpayable", "type": "function"}
+        {"constant": False, "inputs": [{"name": "_spender", "type": "address"}, {"name": "_value", "type": "uint256"}], "name": "approve", "outputs": [{"name": "success", "type": "bool"}], "payable": False, "stateMutability": "nonpayable", "type": "function"},
+        
+        # Events
+        {"anonymous": False, "inputs": [{"indexed": True, "name": "from", "type": "address"}, {"indexed": True, "name": "to", "type": "address"}, {"indexed": False, "name": "value", "type": "uint256"}], "name": "Transfer", "type": "event"}
     ]
 
     # Flashbots RPC endpoint
@@ -121,6 +124,8 @@ class Uniswap(BaseExchange):
             infura_url=self.infura_url,
             v3_pool_addresses=[self.pool_address]
         )
+        # Load initial balances before starting event listening
+        await self.update_balance_cache()
         await self.start_event_listener()
     
     async def load_metadata(self):
@@ -636,7 +641,7 @@ class Uniswap(BaseExchange):
             )
             
             subscription_id = await self.w3_ws.subscription_manager.subscribe([pool_subscription])
-            logger.info(f'Subscription ID: {subscription_id}')
+            logger.info(f'Pool subscription ID: {subscription_id}')
             
             # Handle subscriptions (this is a long-running task)
             await self.w3_ws.subscription_manager.handle_subscriptions()
@@ -647,11 +652,284 @@ class Uniswap(BaseExchange):
 
     async def start_event_listener(self):
         """
-        Start the event listener.
+        Start the event listener for pool events and balance changes.
+        
+        This method coordinates the initialization of both pool event monitoring and balance
+        monitoring via WebSocket subscriptions, ensuring they share the same connection.
         """
-        asyncio.create_task(self._balance_update_loop())
-        asyncio.create_task(self.start_listening_chain_events())
-        await self.token_monitor.start_monitoring()
+        try:
+            # Initialize WebSocket connection first
+            await self._initialize_ws_connection()
+            
+            # Set up pool event subscriptions and balance subscriptions
+            # These will be added to the subscription manager but not yet started
+            await self.setup_pool_event_subscriptions()
+            await self.start_balance_subscription()
+            
+            # Start token monitoring (separate process)
+            await self.token_monitor.start_monitoring()
+            
+            # Now start handling all subscriptions with a single handler
+            logger.info("Starting to handle all WebSocket subscriptions")
+            await self.w3_ws.subscription_manager.handle_subscriptions()
+            
+        except Exception as e:
+            logger.error(f"Error in event listener setup: {e}")
+            logger.error(traceback.format_exc())
+            # Fall back to polling for balances if needed
+            asyncio.create_task(self._balance_update_loop())
+    
+    async def setup_pool_event_subscriptions(self):
+        """
+        Set up subscriptions for pool events (Swap, Mint, Burn).
+        """
+        try:
+            logger.info(f'Setting up subscriptions for {", ".join(self.get_relevant_pool_events().keys())} topics on {self.pool_address}')
+            
+            # Get the event topics and ensure they have 0x prefix
+            event_topics = list(self.get_relevant_pool_events().values())
+            
+            # Create the subscription for pool events
+            pool_subscription = LogsSubscription(
+                label='pool_subscription',
+                address=self.pool_address,  
+                topics=[event_topics],  # This is correct - we need a list within a list for "or" condition
+                handler=self.process_event
+            )
+            
+            # Add the subscription but don't start handling yet
+            subscription_id = await self.w3_ws.subscription_manager.subscribe([pool_subscription])
+            logger.info(f'Pool subscription ID: {subscription_id}')
+            
+        except Exception as e:
+            logger.error(f"Error setting up pool event subscriptions: {e}")
+            logger.error(traceback.format_exc())
+
+    async def start_balance_subscription(self):
+        """
+        Subscribe to token balance changes via Transfer events on WebSocket.
+        
+        This method sets up WebSocket subscriptions to monitor Transfer events for 
+        each token in the pool, updating balance cache in real-time whenever tokens 
+        are transferred to or from the account address.
+        """
+        try:
+            # Make sure WebSocket connection is initialized
+            await self._initialize_ws_connection()
+            
+            # Create topics for Transfer events (indexed fields)
+            # We need to listen when our account is either sender or receiver
+            account_topic = '0x' + self.account.address[2:].lower().zfill(64)  # Format for indexed address
+            transfer_event_signature = self.async_w3.keccak(text="Transfer(address,address,uint256)").hex()
+            if not transfer_event_signature.startswith('0x'):
+                transfer_event_signature = '0x' + transfer_event_signature
+            
+            logger.info(f"Setting up balance subscriptions for account: {self.account.address}")
+            logger.info(f"Using Transfer event signature: {transfer_event_signature}")
+            logger.info(f"Using account topic: {account_topic}")
+            
+            # Create subscription for token0
+            token0_subscription = LogsSubscription(
+                label='token0_balance_subscription',
+                address=self.metadata['token0'].address,
+                topics=[
+                    transfer_event_signature,  # Event signature
+                    account_topic,  # When we're the sender
+                    None
+                ],
+                handler=self.process_token0_transfer
+            )
+            
+            token0_receive_subscription = LogsSubscription(
+                label='token0_receive_subscription',
+                address=self.metadata['token0'].address,
+                topics=[
+                    transfer_event_signature,  # Event signature
+                    None,
+                    account_topic  # When we're the receiver
+                ],
+                handler=self.process_token0_transfer
+            )
+            
+            # Create subscription for token1
+            token1_subscription = LogsSubscription(
+                label='token1_balance_subscription',
+                address=self.metadata['token1'].address,
+                topics=[
+                    transfer_event_signature,  # Event signature
+                    account_topic,  # When we're the sender
+                    None
+                ],
+                handler=self.process_token1_transfer
+            )
+            
+            token1_receive_subscription = LogsSubscription(
+                label='token1_receive_subscription',
+                address=self.metadata['token1'].address,
+                topics=[
+                    transfer_event_signature,  # Event signature
+                    None,
+                    account_topic  # When we're the receiver
+                ],
+                handler=self.process_token1_transfer
+            )
+            
+            # Subscribe to all balance events (excluding ETH for now)
+            subscriptions = [
+                token0_subscription,
+                token0_receive_subscription,
+                token1_subscription, 
+                token1_receive_subscription
+            ]
+            
+            # Add all subscriptions
+            subscription_ids = await self.w3_ws.subscription_manager.subscribe(subscriptions)
+            logger.info(f"Balance subscription IDs: {subscription_ids}")
+            
+            # Start a separate task to periodically check ETH balance
+            # since we can't use BlockSubscription
+            asyncio.create_task(self._eth_balance_check_loop())
+            
+            # Note: We don't handle subscriptions here as it's handled in start_event_listener()
+            
+        except Exception as e:
+            logger.error(f"Error in balance subscription: {e}")
+            logger.error(traceback.format_exc())
+            # Fall back to polling method if subscription fails
+            logger.info("Falling back to polling method for balance updates")
+            asyncio.create_task(self._balance_update_loop())
+            
+    async def _eth_balance_check_loop(self):
+        """
+        Periodically check ETH balance to detect changes.
+        This is used as an alternative to BlockSubscription.
+        """
+        try:
+            last_eth_balance = 0
+            check_interval = 5  # Check every 5 seconds
+            
+            while True:
+                # Get the current ETH balance
+                current_eth_balance = await self.async_w3.eth.get_balance(self.account.address)
+                eth_balance = current_eth_balance / (10 ** self.metadata['ETH'].decimals)
+                
+                # Check if the balance has changed
+                if 'eth' not in self.balances or abs(self.balances['eth'] - eth_balance) > 1e-10:
+                    # Update the balance cache
+                    self.balances['eth'] = eth_balance
+                    
+                    # Log the updated balance
+                    logger.info(f"ETH balance updated: {eth_balance}")
+                
+                await asyncio.sleep(check_interval)
+                
+        except Exception as e:
+            logger.error(f"Error in ETH balance check loop: {e}")
+            logger.error(traceback.format_exc())
+
+    async def process_token0_transfer(self, event):
+        """
+        Process a Transfer event for token0.
+        
+        Args:
+            event: The Transfer event data
+        """
+        try:
+            # Process the Transfer event
+            event = event.result
+            
+            # Create contract to decode the event
+            contract = self.async_w3.eth.contract(
+                address=self.metadata['token0'].address,
+                abi=self.ERC20_ABI
+            )
+            
+            # Decode the event
+            decoded_event = contract.events.Transfer().process_log(event)
+            
+            # Update balance by fetching current balance
+            contract = self.async_w3.eth.contract(
+                address=self.metadata['token0'].address,
+                abi=self.ERC20_ABI
+            )
+            
+            balance = await contract.functions.balanceOf(self.account.address).call()
+            decimals = self.metadata['token0'].decimals
+            token0_balance = balance / (10 ** decimals)
+            
+            # Update the balance cache
+            self.balances[self.metadata['token0'].symbol.lower()] = token0_balance
+            
+            # Log the updated balance
+            logger.info(f"Token0 ({self.metadata['token0'].symbol}) balance updated: {token0_balance}")
+            
+        except Exception as e:
+            logger.error(f"Error processing token0 transfer: {e}")
+            logger.error(traceback.format_exc())
+
+    async def process_token1_transfer(self, event):
+        """
+        Process a Transfer event for token1.
+        
+        Args:
+            event: The Transfer event data
+        """
+        try:
+            # Process the Transfer event
+            event = event.result
+            
+            # Create contract to decode the event
+            contract = self.async_w3.eth.contract(
+                address=self.metadata['token1'].address,
+                abi=self.ERC20_ABI
+            )
+            
+            # Decode the event
+            decoded_event = contract.events.Transfer().process_log(event)
+            
+            # Update balance by fetching current balance
+            contract = self.async_w3.eth.contract(
+                address=self.metadata['token1'].address,
+                abi=self.ERC20_ABI
+            )
+            
+            balance = await contract.functions.balanceOf(self.account.address).call()
+            decimals = self.metadata['token1'].decimals
+            token1_balance = balance / (10 ** decimals)
+            
+            # Update the balance cache
+            self.balances[self.metadata['token1'].symbol.lower()] = token1_balance
+            
+            # Log the updated balance
+            logger.info(f"Token1 ({self.metadata['token1'].symbol}) balance updated: {token1_balance}")
+            
+        except Exception as e:
+            logger.error(f"Error processing token1 transfer: {e}")
+            logger.error(traceback.format_exc())
+    
+    async def check_eth_balance_on_new_block(self, block_info):
+        """
+        Check ETH balance on each new block to detect changes.
+        
+        Args:
+            block_info: Information about the new block
+        """
+        try:
+            # Get the current ETH balance
+            current_eth_balance = await self.async_w3.eth.get_balance(self.account.address)
+            eth_balance = current_eth_balance / (10 ** self.metadata['ETH'].decimals)
+            
+            # Check if the balance has changed
+            if 'eth' not in self.balances or self.balances['eth'] != eth_balance:
+                # Update the balance cache
+                self.balances['eth'] = eth_balance
+                
+                # Log the updated balance
+                logger.info(f"ETH balance updated: {eth_balance}")
+                
+        except Exception as e:
+            logger.error(f"Error checking ETH balance: {e}")
+            logger.error(traceback.format_exc())
     
     async def get_deposit_address(self, instrument: str) -> str:
         """
