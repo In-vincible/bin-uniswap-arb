@@ -13,6 +13,7 @@ import traceback
 from config import Config
 from exchanges.base_connector import BaseExchange
 from token_monitoring import TokenMonitor
+from liquidity_tracker_v3 import LiquidityTracker
 
 logging.basicConfig(
     level=logging.INFO,
@@ -73,7 +74,10 @@ class Uniswap(BaseExchange):
 
         # Swap Router ABI
         {"constant": True, "inputs": [{"name": "_owner", "type": "address"}, {"name": "_spender", "type": "address"}], "name": "allowance", "outputs": [{"name": "remaining", "type": "uint256"}], "payable": False, "stateMutability": "view", "type": "function"},
-        {"constant": False, "inputs": [{"name": "_spender", "type": "address"}, {"name": "_value", "type": "uint256"}], "name": "approve", "outputs": [{"name": "success", "type": "bool"}], "payable": False, "stateMutability": "nonpayable", "type": "function"}
+        {"constant": False, "inputs": [{"name": "_spender", "type": "address"}, {"name": "_value", "type": "uint256"}], "name": "approve", "outputs": [{"name": "success", "type": "bool"}], "payable": False, "stateMutability": "nonpayable", "type": "function"},
+        
+        # Events
+        {"anonymous": False, "inputs": [{"indexed": True, "name": "from", "type": "address"}, {"indexed": True, "name": "to", "type": "address"}, {"indexed": False, "name": "value", "type": "uint256"}], "name": "Transfer", "type": "event"}
     ]
 
     # Flashbots RPC endpoint
@@ -116,11 +120,17 @@ class Uniswap(BaseExchange):
         Initialize the Uniswap connector.
         """
         self.metadata = await self.load_metadata()
+        
+        # Initialize the liquidity tracker
+        await self._initialize_liquidity_tracker()
+        
         self.token_monitor = TokenMonitor(
             token_addresses=[self.metadata['token0'].address, self.metadata['token1'].address],
             infura_url=self.infura_url,
             v3_pool_addresses=[self.pool_address]
         )
+        # Load initial balances before starting event listening
+        await self.update_balance_cache()
         await self.start_event_listener()
     
     async def load_metadata(self):
@@ -497,37 +507,71 @@ class Uniswap(BaseExchange):
     def process_mint(self, event):
         """
         Process a mint event.
+        
+        This adds liquidity to a specific tick range.
         """
         mint_event = self.pool_contract.events.Mint().process_log(event)
-        tick_lower = mint_event.args.tickLower
-        tick_upper = mint_event.args.tickUpper
+        tick_lower = int(mint_event.args.tickLower)
+        tick_upper = int(mint_event.args.tickUpper)
+        amount = int(mint_event.args.amount)
+        owner = mint_event.args.owner
+        
+        logger.info(f'Mint event: tickLower={tick_lower}, tickUpper={tick_upper}, amount={amount}, owner={owner}')
+        
+        # If the liquidity tracker is initialized, update it with the mint event
+        if hasattr(self, 'liquidity_tracker') and self.liquidity_tracker is not None:
+            self.liquidity_tracker.add_position(tick_lower, tick_upper, amount, owner)
+            logger.info(f"Added position to liquidity tracker: ({tick_lower}, {tick_upper}) owner={owner}, amount={amount}")
+        
+        # Check if the mint is within current tick boundaries
         if tick_lower <= self.tick and tick_upper >= self.tick:
-            self.liquidity += mint_event.args.amount
-            logger.info(f'liquidity: {self.liquidity}')
+            self.liquidity += amount
+            logger.info(f'Increased active liquidity by {amount}. New total: {self.liquidity}')
         else:
-            logger.info(f"Mint event is not within the tick boundaries: {tick_lower} <= {self.tick} <= {tick_upper}")
+            logger.info(f"Mint event is not within the active tick boundaries: {tick_lower} <= {self.tick} <= {tick_upper}")
     
     def process_burn(self, event):
         """
         Process a burn event.
+        
+        This removes liquidity from a specific tick range.
         """
         burn_event = self.pool_contract.events.Burn().process_log(event)
-        tick_lower = burn_event.args.tickLower
-        tick_upper = burn_event.args.tickUpper
-        if tick_lower <= self.tick and tick_upper >= self.tick:
-            self.liquidity -= burn_event.args.amount
-            logger.info(f'liquidity: {self.liquidity}')
-        else:
-            logger.info(f"Burn event is not within the tick boundaries: {tick_lower} <= {self.tick} <= {tick_upper}")
+        tick_lower = int(burn_event.args.tickLower)
+        tick_upper = int(burn_event.args.tickUpper)
+        amount = int(burn_event.args.amount)
+        owner = burn_event.args.owner
         
+        logger.info(f'Burn event: tickLower={tick_lower}, tickUpper={tick_upper}, amount={amount}, owner={owner}')
+        
+        # If the liquidity tracker is initialized, update it with the burn event
+        if hasattr(self, 'liquidity_tracker') and self.liquidity_tracker is not None:
+            self.liquidity_tracker.remove_position(tick_lower, tick_upper, amount, owner)
+            logger.info(f"Removed position from liquidity tracker: ({tick_lower}, {tick_upper}) owner={owner}, amount={amount}")
+        
+        # Check if the burn is within current tick boundaries (affects active liquidity)
+        if tick_lower <= self.tick and tick_upper >= self.tick:
+            self.liquidity -= amount
+            logger.info(f'Decreased active liquidity by {amount}. New total: {self.liquidity}')
+        else:
+            logger.info(f"Burn event is not within the active tick boundaries: {tick_lower} <= {self.tick} <= {tick_upper}")
+    
     def process_swaps(self, event):
         """
         Process a swap event.
         """
         swap_event = self.pool_contract.events.Swap().process_log(event)
-        self.liquidity = swap_event.args.liquidity
-        self.sqrt_price = swap_event.args.sqrtPriceX96
-        self.tick = swap_event.args.tick
+        self.liquidity = int(swap_event.args.liquidity)
+        self.sqrt_price = int(swap_event.args.sqrtPriceX96)
+        self.tick = int(swap_event.args.tick)
+        
+        # Update the liquidity tracker with the new tick and sqrt price
+        if hasattr(self, 'liquidity_tracker') and self.liquidity_tracker is not None:
+            self.liquidity_tracker.update_pool_state(self.tick, self.sqrt_price)
+            logger.info(f"Updated liquidity tracker state: tick={self.tick}, sqrtPriceX96={self.sqrt_price}")
+            
+            # Validate the liquidity tracker against the event liquidity
+            self.validate_liquidity_tracker(self.liquidity)
         
         sqrt_price_lower, sqrt_price_upper = self.get_sqrt_price_x96_boundaries(self.tick)
         lower_tick, upper_tick = self.get_tick_boundaries(self.tick)
@@ -619,39 +663,374 @@ class Uniswap(BaseExchange):
             logger.error(f"Error processing event: {e}")
             logger.error(traceback.format_exc())
     
-    async def start_listening_chain_events(self):
+    async def start_event_listener(self):
         """
-        Start listening for relevant pool events.
+        Start the event listener for pool events and balance changes.
+        
+        This method coordinates the initialization of both pool event monitoring and balance
+        monitoring via WebSocket subscriptions, ensuring they share the same connection.
         """
         try:
+            # Initialize WebSocket connection first
             await self._initialize_ws_connection()
-            logger.info(f'Subscribing to {", ".join(self.get_relevant_pool_events().keys())} topics on {self.pool_address}')
             
-            # Create the subscription
-            pool_subscription = LogsSubscription(
-                label='pool_subscription',
-                address=self.pool_address,  
-                topics=[list(self.get_relevant_pool_events().values())],
-                handler=self.process_event
-            )
+            # Set up pool event subscriptions and balance subscriptions
+            # These will be added to the subscription manager but not yet started
+            await self.setup_pool_event_subscriptions()
+            await self.start_balance_subscription()
             
-            subscription_id = await self.w3_ws.subscription_manager.subscribe([pool_subscription])
-            logger.info(f'Subscription ID: {subscription_id}')
+            # Start token monitoring (separate process)
+            await self.token_monitor.start_monitoring()
             
-            # Handle subscriptions (this is a long-running task)
+            # Now start handling all subscriptions with a single handler
+            logger.info("Starting to handle all WebSocket subscriptions")
             await self.w3_ws.subscription_manager.handle_subscriptions()
             
         except Exception as e:
-            logger.error(f"Error in event listener: {e}")
+            logger.error(f"Error in event listener setup: {e}")
+            logger.error(traceback.format_exc())
+            # Fall back to polling for balances if needed
+            asyncio.create_task(self._balance_update_loop())
+    
+    async def setup_pool_event_subscriptions(self):
+        """
+        Set up subscriptions for pool events (Swap, Mint, Burn).
+        """
+        try:
+            logger.info(f'Setting up subscriptions for {", ".join(self.get_relevant_pool_events().keys())} topics on {self.pool_address}')
+            
+            # Get the event topics and ensure they have 0x prefix
+            event_topics = list(self.get_relevant_pool_events().values())
+            
+            # Check if we need to process historical events first
+            if hasattr(self, 'latest_block_number') and self.latest_block_number is not None:
+                # Fetch historical events from last synced block to latest
+                latest_block = await self.async_w3.eth.block_number
+                start_block = self.latest_block_number + 1
+                
+                if start_block < latest_block:
+                    logger.info(f"Fetching historical events from block {start_block} to {latest_block}")
+                    await self._fetch_historical_events(start_block, latest_block)
+            
+            # Create the subscription for pool events (websocket subscriptions only work for new events)
+            pool_subscription = LogsSubscription(
+                label='pool_subscription',
+                address=self.pool_address,  
+                topics=[event_topics],
+                handler=self.process_event
+            )
+            
+            # Add the subscription but don't start handling yet
+            subscription_id = await self.w3_ws.subscription_manager.subscribe([pool_subscription])
+            logger.info(f'Pool subscription ID: {subscription_id}')
+            
+        except Exception as e:
+            logger.error(f"Error setting up pool event subscriptions: {e}")
             logger.error(traceback.format_exc())
 
-    async def start_event_listener(self):
+    async def _fetch_historical_events(self, from_block, to_block):
         """
-        Start the event listener.
+        Fetch historical events between specified blocks and process them.
+        
+        Args:
+            from_block: Starting block number
+            to_block: Ending block number
         """
-        asyncio.create_task(self._balance_update_loop())
-        asyncio.create_task(self.start_listening_chain_events())
-        await self.token_monitor.start_monitoring()
+        try:
+            logger.info(f"Fetching historical events from block {from_block} to {to_block}")
+            
+            # Get the event topics
+            event_map = self.get_relevant_pool_events()
+            event_topics = list(event_map.values())
+            
+            # Create filter for logs
+            logs_filter = {
+                'address': self.pool_address,
+                'fromBlock': from_block,
+                'toBlock': to_block,
+                'topics': [event_topics]  # First argument is an array of topics to match any of them
+            }
+            
+            # Fetch logs
+            logs = await self.async_w3.eth.get_logs(logs_filter)
+            logger.info(f"Found {len(logs)} historical events to process")
+            
+            # Process each event
+            for log in logs:
+                try:
+                    # We need to determine event type based on the topic
+                    topic = log['topics'][0].hex()
+                    
+                    if topic == self.mint_topic:
+                        logger.info(f"Processing historical Mint event at block {log['blockNumber']}")
+                        self.process_mint(log)
+                    elif topic == self.burn_topic:
+                        logger.info(f"Processing historical Burn event at block {log['blockNumber']}")
+                        self.process_burn(log)
+                    elif topic == self.swap_topic:
+                        logger.info(f"Processing historical Swap event at block {log['blockNumber']}")
+                        self.process_swaps(log)
+                    else:
+                        logger.warning(f"Unknown event topic: {topic}")
+                except Exception as e:
+                    logger.error(f"Error processing historical event: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Error fetching historical events: {e}")
+            logger.error(traceback.format_exc())
+    
+    async def start_balance_subscription(self):
+        """
+        Subscribe to token balance changes via Transfer events on WebSocket.
+        
+        This method sets up WebSocket subscriptions to monitor Transfer events for 
+        each token in the pool, updating balance cache in real-time whenever tokens 
+        are transferred to or from the account address.
+        """
+        try:
+            # Make sure WebSocket connection is initialized
+            await self._initialize_ws_connection()
+            
+            # Create topics for Transfer events (indexed fields)
+            # We need to listen when our account is either sender or receiver
+            account_topic = '0x' + self.account.address[2:].lower().zfill(64)  # Format for indexed address
+            transfer_event_signature = self.async_w3.keccak(text="Transfer(address,address,uint256)").hex()
+            if not transfer_event_signature.startswith('0x'):
+                transfer_event_signature = '0x' + transfer_event_signature
+            
+            logger.info(f"Setting up balance subscriptions for account: {self.account.address}")
+            logger.info(f"Using Transfer event signature: {transfer_event_signature}")
+            logger.info(f"Using account topic: {account_topic}")
+            
+            # Create subscription for token0
+            token0_subscription = LogsSubscription(
+                label='token0_balance_subscription',
+                address=self.metadata['token0'].address,
+                topics=[
+                    transfer_event_signature,  # Event signature
+                    account_topic,  # When we're the sender
+                    None
+                ],
+                handler=self.process_token0_transfer
+            )
+            
+            token0_receive_subscription = LogsSubscription(
+                label='token0_receive_subscription',
+                address=self.metadata['token0'].address,
+                topics=[
+                    transfer_event_signature,  # Event signature
+                    None,
+                    account_topic  # When we're the receiver
+                ],
+                handler=self.process_token0_transfer
+            )
+            
+            # Create subscription for token1
+            token1_subscription = LogsSubscription(
+                label='token1_balance_subscription',
+                address=self.metadata['token1'].address,
+                topics=[
+                    transfer_event_signature,  # Event signature
+                    account_topic,  # When we're the sender
+                    None
+                ],
+                handler=self.process_token1_transfer
+            )
+            
+            token1_receive_subscription = LogsSubscription(
+                label='token1_receive_subscription',
+                address=self.metadata['token1'].address,
+                topics=[
+                    transfer_event_signature,  # Event signature
+                    None,
+                    account_topic  # When we're the receiver
+                ],
+                handler=self.process_token1_transfer
+            )
+            
+            # Subscribe to all balance events 
+            subscriptions = [
+                token0_subscription,
+                token0_receive_subscription,
+                token1_subscription, 
+                token1_receive_subscription
+            ]
+            
+            # Add all subscriptions
+            subscription_ids = await self.w3_ws.subscription_manager.subscribe(subscriptions)
+            logger.info(f"Balance subscription IDs: {subscription_ids}")
+            
+            # Add newHeads subscription for ETH balance monitoring
+            await self.setup_eth_balance_subscription()
+            
+            # Note: We don't handle subscriptions here as it's handled in start_event_listener()
+            
+        except Exception as e:
+            logger.error(f"Error in balance subscription: {e}")
+            logger.error(traceback.format_exc())
+            # Fall back to polling method if subscription fails
+            logger.info("Falling back to polling method for balance updates")
+            asyncio.create_task(self._balance_update_loop())
+    
+    async def setup_eth_balance_subscription(self):
+        """
+        Set up a newHeads subscription to monitor ETH balance changes.
+        
+        This subscribes to new block headers and checks if the ETH balance 
+        has changed whenever a new block is mined.
+        """
+        try:
+            logger.info("Setting up ETH balance subscription via newHeads")
+            
+            # Create a custom handler for new blocks
+            async def new_block_handler(block_header):
+                try:
+                    # Get the current ETH balance
+                    current_eth_balance = await self.async_w3.eth.get_balance(self.account.address)
+                    eth_balance = current_eth_balance / (10 ** self.metadata['ETH'].decimals)
+                    
+                    # Check if the balance has changed significantly (allow for small floating point differences)
+                    if 'eth' not in self.balances or abs(self.balances['eth'] - eth_balance) > 1e-10:
+                        old_balance = self.balances.get('eth', 0)
+                        # Update the balance cache
+                        self.balances['eth'] = eth_balance
+                        
+                        # Calculate and log the change
+                        change = eth_balance - old_balance
+                        direction = "increased" if change > 0 else "decreased"
+                        
+                        # Log the updated balance with block info
+                        logger.info(f"ETH balance {direction} by {abs(change):.8f} ETH in block {block_header['number']}. New balance: {eth_balance:.8f} ETH")
+                        
+                except Exception as e:
+                    logger.error(f"Error processing new block for ETH balance check: {e}")
+                    logger.error(traceback.format_exc())
+            
+            # Subscribe to newHeads (new block headers)
+            # This requires an alternate subscription approach since it's not a logs subscription
+            subscription_id = await self.w3_ws.eth.subscribe("newHeads", new_block_handler)
+            
+            logger.info(f"ETH balance subscription ID (newHeads): {subscription_id}")
+            
+        except Exception as e:
+            logger.error(f"Error setting up ETH balance subscription: {e}")
+            logger.error(traceback.format_exc())
+            # Fall back to polling as a backup
+            logger.info("Falling back to polling method for ETH balance updates")
+            asyncio.create_task(self._eth_balance_check_loop())
+            
+    async def _eth_balance_check_loop(self):
+        """
+        Periodically check ETH balance to detect changes.
+        This is used as an alternative to WebSocket subscription if that fails.
+        """
+        try:
+            check_interval = 5  # Check every 5 seconds
+            
+            while True:
+                # Get the current ETH balance
+                current_eth_balance = await self.async_w3.eth.get_balance(self.account.address)
+                eth_balance = current_eth_balance / (10 ** self.metadata['ETH'].decimals)
+                
+                # Check if the balance has changed
+                if 'eth' not in self.balances or abs(self.balances['eth'] - eth_balance) > 1e-10:
+                    old_balance = self.balances.get('eth', 0)
+                    # Update the balance cache
+                    self.balances['eth'] = eth_balance
+                    
+                    # Calculate and log the change
+                    change = eth_balance - old_balance
+                    direction = "increased" if change > 0 else "decreased"
+                    
+                    # Log the updated balance
+                    logger.info(f"ETH balance {direction} by {abs(change):.8f} ETH (polling). New balance: {eth_balance:.8f} ETH")
+                
+                await asyncio.sleep(check_interval)
+                
+        except Exception as e:
+            logger.error(f"Error in ETH balance check loop: {e}")
+            logger.error(traceback.format_exc())
+
+    async def process_token0_transfer(self, event):
+        """
+        Process a Transfer event for token0.
+        
+        Args:
+            event: The Transfer event data
+        """
+        try:
+            # Process the Transfer event
+            event = event.result
+            
+            # Create contract to decode the event
+            contract = self.async_w3.eth.contract(
+                address=self.metadata['token0'].address,
+                abi=self.ERC20_ABI
+            )
+            
+            # Decode the event
+            decoded_event = contract.events.Transfer().process_log(event)
+            
+            # Update balance by fetching current balance
+            contract = self.async_w3.eth.contract(
+                address=self.metadata['token0'].address,
+                abi=self.ERC20_ABI
+            )
+            
+            balance = await contract.functions.balanceOf(self.account.address).call()
+            decimals = self.metadata['token0'].decimals
+            token0_balance = balance / (10 ** decimals)
+            
+            # Update the balance cache
+            self.balances[self.metadata['token0'].symbol.lower()] = token0_balance
+            
+            # Log the updated balance
+            logger.info(f"Token0 ({self.metadata['token0'].symbol}) balance updated: {token0_balance}")
+            
+        except Exception as e:
+            logger.error(f"Error processing token0 transfer: {e}")
+            logger.error(traceback.format_exc())
+
+    async def process_token1_transfer(self, event):
+        """
+        Process a Transfer event for token1.
+        
+        Args:
+            event: The Transfer event data
+        """
+        try:
+            # Process the Transfer event
+            event = event.result
+            
+            # Create contract to decode the event
+            contract = self.async_w3.eth.contract(
+                address=self.metadata['token1'].address,
+                abi=self.ERC20_ABI
+            )
+            
+            # Decode the event
+            decoded_event = contract.events.Transfer().process_log(event)
+            
+            # Update balance by fetching current balance
+            contract = self.async_w3.eth.contract(
+                address=self.metadata['token1'].address,
+                abi=self.ERC20_ABI
+            )
+            
+            balance = await contract.functions.balanceOf(self.account.address).call()
+            decimals = self.metadata['token1'].decimals
+            token1_balance = balance / (10 ** decimals)
+            
+            # Update the balance cache
+            self.balances[self.metadata['token1'].symbol.lower()] = token1_balance
+            
+            # Log the updated balance
+            logger.info(f"Token1 ({self.metadata['token1'].symbol}) balance updated: {token1_balance}")
+            
+        except Exception as e:
+            logger.error(f"Error processing token1 transfer: {e}")
+            logger.error(traceback.format_exc())
+    
     
     async def get_deposit_address(self, instrument: str) -> str:
         """
@@ -1237,18 +1616,121 @@ class Uniswap(BaseExchange):
     
     async def _compute_slippage_cost(self, asset: str, amount: float, direction: str) -> float:
         """
-        Compute the slippage cost in basis points (bps) for a specific asset and amount.
+        Compute the slippage cost for a given amount and direction.
         
-        This calculates the price impact of executing a trade of the given size by comparing
-        the effective execution price to the current market price.
+        This uses the liquidity tracker to simulate swaps across multiple ticks,
+        providing a more accurate slippage estimate for larger trades.
         
         Args:
-            asset (str): Asset symbol to compute slippage for
-            amount (float): Amount of asset to trade
-            direction (str): Trade direction - either 'buy' or 'sell'
+            asset: The asset to swap ('token0' or 'token1')
+            amount: The amount of asset to swap (in asset units)
+            direction: 'buy' or 'sell'
             
         Returns:
             float: Slippage cost in basis points (bps). Positive values indicate worse prices.
+        """
+        # Check if liquidity tracker is initialized
+        if not hasattr(self, 'liquidity_tracker') or self.liquidity_tracker is None:
+            logger.warning("Liquidity tracker not initialized, falling back to simple slippage estimate")
+            return await self._compute_simple_slippage_cost(asset, amount, direction)
+            
+        try:
+            # Get current market price from sqrt price
+            token0_price, token1_price = self.compute_price_from_sqrt_price_x96()
+            current_market_price = token1_price  # Standard quote is token0 per token1
+            
+            # Determine token symbols for clarity
+            token0_symbol = self.metadata['token0'].symbol
+            token1_symbol = self.metadata['token1'].symbol
+            
+            # Convert to decimal amounts based on token decimals
+            token0_decimals = self.metadata['token0'].decimals
+            token1_decimals = self.metadata['token1'].decimals
+            
+            is_token0 = (asset == token0_symbol)
+            
+            logger.info(f"Computing slippage for {amount} {asset}, direction: {direction}")
+            logger.info(f"Current price: {current_market_price} {token0_symbol}/{token1_symbol}")
+            
+            if is_token0:
+                # Trading token0
+                if direction == 'buy':
+                    # Buying token0, selling token1
+                    # First, estimate how much token1 we need to swap for the desired token0
+                    # This is a rough estimate using the current price
+                    estimated_token1_amount = amount * current_market_price
+                    
+                    # Simulate the swap
+                    token0_out, token1_in, _ = self.liquidity_tracker.simulate_upward_swap(estimated_token1_amount)
+                    
+                    # Calculate effective price
+                    if token0_out > 0:
+                        effective_price = token1_in / token0_out
+                        slippage_bps = ((effective_price / current_market_price) - 1) * 10_000
+                        logger.info(f"Simulated buying {token0_out} {token0_symbol} for {token1_in} {token1_symbol}")
+                        logger.info(f"Effective price: {effective_price}, slippage: {slippage_bps} bps")
+                        return slippage_bps
+                else:
+                    # Selling token0, buying token1
+                    token1_out, token0_in, _ = self.liquidity_tracker.simulate_downward_swap(amount)
+                    
+                    if token1_out > 0:
+                        effective_price = token0_in / token1_out  # Inverse of what we want
+                        inverse_effective_price = 1 / effective_price if effective_price > 0 else 0
+                        slippage_bps = (1 - (inverse_effective_price / current_market_price)) * 10_000
+                        logger.info(f"Simulated selling {token0_in} {token0_symbol} for {token1_out} {token1_symbol}")
+                        logger.info(f"Effective price: {inverse_effective_price}, slippage: {slippage_bps} bps")
+                        return slippage_bps
+            else:
+                # Trading token1
+                if direction == 'buy':
+                    # Buying token1, selling token0
+                    estimated_token0_amount = amount / current_market_price
+                    
+                    token1_out, token0_in, _ = self.liquidity_tracker.simulate_downward_swap(estimated_token0_amount)
+                    
+                    if token1_out > 0:
+                        effective_price = token0_in / token1_out
+                        inverse_effective_price = 1 / effective_price if effective_price > 0 else 0
+                        slippage_bps = (1 - (inverse_effective_price / current_market_price)) * 10_000
+                        logger.info(f"Simulated buying {token1_out} {token1_symbol} for {token0_in} {token0_symbol}")
+                        logger.info(f"Effective price: {inverse_effective_price}, slippage: {slippage_bps} bps")
+                        return slippage_bps
+                else:
+                    # Selling token1, buying token0
+                    token0_out, token1_in, _ = self.liquidity_tracker.simulate_upward_swap(amount)
+                    
+                    if token0_out > 0:
+                        effective_price = token1_in / token0_out
+                        slippage_bps = ((effective_price / current_market_price) - 1) * 10_000
+                        logger.info(f"Simulated selling {token1_in} {token1_symbol} for {token0_out} {token0_symbol}")
+                        logger.info(f"Effective price: {effective_price}, slippage: {slippage_bps} bps")
+                        return slippage_bps
+            
+            # If we get here, something went wrong with the simulation
+            logger.error("Failed to compute slippage, falling back to simple estimate")
+            return await self._compute_simple_slippage_cost(asset, amount, direction)
+            
+        except Exception as e:
+            logger.error(f"Error computing slippage: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return await self._compute_simple_slippage_cost(asset, amount, direction)
+    
+    async def _compute_simple_slippage_cost(self, asset: str, amount: float, direction: str) -> float:
+        """
+        Simple slippage cost computation using tick boundary estimates.
+        
+        This is the original implementation that only considers liquidity within the current tick.
+        Used as a fallback when the liquidity tracker is not available.
+        
+        Args:
+            asset: The asset to swap
+            amount: The amount to swap
+            direction: 'buy' or 'sell'
+            
+        Returns:
+            float: Slippage cost in basis points
         """
         # Get current market price from sqrt price
         token0_price, token1_price = self.compute_price_from_sqrt_price_x96()
@@ -1546,6 +2028,121 @@ class Uniswap(BaseExchange):
             logger.error(f"Error unwrapping {asset}: {str(e)}")
             logger.error(traceback.format_exc())
             return 0
+
+    async def _initialize_liquidity_tracker(self):
+        """
+        Initialize the liquidity tracker with the current pool state and historical positions.
+        
+        This method:
+        1. Creates a LiquidityTracker instance with current tick and sqrtPriceX96
+        2. Fetches historical positions from the subgraph
+        3. Registers the tracker for use in processing events
+        """
+        from liquidity_tracker_v3 import LiquidityTracker
+        
+        logger.info(f"Initializing liquidity tracker for pool {self.pool_address}")
+        
+        try:
+            # Create a liquidity tracker with the current tick and sqrt price
+            self.liquidity_tracker = LiquidityTracker(
+                current_tick=self.tick,
+                current_sqrtPriceX96=self.sqrt_price
+            )
+            
+            # Initialize from subgraph data
+            min_liquidity = 1  # Filter out zero liquidity positions
+            success = await self.liquidity_tracker.init_from_subgraph(
+                pool_id=self.pool_address,
+                min_liquidity=min_liquidity
+            )
+            
+            if success:
+                # Get sync block info for debugging
+                sync_info = self.liquidity_tracker.get_sync_block_info()
+                logger.info(f"Liquidity tracker initialized from subgraph at block #{sync_info['number']}")
+                
+                # Validate the tracker against current on-chain liquidity
+                current_liquidity = self.liquidity
+                tracker_liquidity = self.liquidity_tracker.get_active_liquidity()
+                
+                # Calculate percentage error
+                if current_liquidity > 0 and tracker_liquidity > 0:
+                    percentage_error = abs(current_liquidity - tracker_liquidity) / max(current_liquidity, tracker_liquidity) * 100
+                    logger.info(f"Initial validation - On-chain: {current_liquidity}, Tracker: {tracker_liquidity}, Error: {percentage_error:.2f}%")
+                else:
+                    logger.info(f"Initial validation - On-chain: {current_liquidity}, Tracker: {tracker_liquidity} (skipping percentage calculation)")
+                
+                # Log total unique positions
+                position_count = len(self.liquidity_tracker.positions)
+                owner_position_count = sum(len(owners) for owners in self.liquidity_tracker.positions.values())
+                logger.info(f"Tracking {position_count} unique tick ranges with {owner_position_count} owner-position combinations")
+                
+                return True
+            else:
+                logger.error("Failed to initialize liquidity tracker from subgraph")
+                self.liquidity_tracker = None
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error initializing liquidity tracker: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            self.liquidity_tracker = None
+            return False
+
+    def validate_liquidity_tracker(self, event_liquidity):
+        """
+        Validate the liquidity tracker against the event liquidity.
+        
+        This compares the active liquidity from the liquidity tracker with
+        the liquidity reported in the swap event to ensure our tracking is accurate.
+        
+        Args:
+            event_liquidity: The liquidity value from the swap event
+        """
+        # Skip validation if liquidity tracker is not initialized
+        if not hasattr(self, 'liquidity_tracker') or self.liquidity_tracker is None:
+            logger.warning("Cannot validate liquidity tracker - not initialized")
+            return
+            
+        try:
+            # Get the active liquidity from the tracker
+            tracker_liquidity = self.liquidity_tracker.get_active_liquidity()
+            
+            # Skip validation if either liquidity is zero
+            if event_liquidity == 0 or tracker_liquidity == 0:
+                logger.info(f"Skipping liquidity validation - event: {event_liquidity}, tracker: {tracker_liquidity}")
+                return
+                
+            # Calculate percentage error
+            percentage_error = abs(event_liquidity - tracker_liquidity) / max(event_liquidity, tracker_liquidity) * 100
+            
+            # Log the comparison results
+            if percentage_error > 1:
+                logger.warning(f"Liquidity tracker validation failed: event={event_liquidity}, tracker={tracker_liquidity}, error={percentage_error:.2f}%")
+                
+                # Log additional debug information about active positions
+                active_positions = []
+                for (tick_lower, tick_upper), total_liquidity in self.liquidity_tracker.range_totals.items():
+                    if tick_lower <= self.tick <= tick_upper:
+                        active_positions.append({
+                            "range": (tick_lower, tick_upper),
+                            "liquidity": total_liquidity,
+                            "owner_count": len(self.liquidity_tracker.positions[(tick_lower, tick_upper)])
+                        })
+                
+                # Log the details of the active positions for debugging
+                if active_positions:
+                    logger.info(f"Active positions ({len(active_positions)}): {active_positions[:3]}...")
+                else:
+                    logger.warning("No active positions found in liquidity tracker!")
+            else:
+                logger.info(f"Liquidity tracker validation passed: event={event_liquidity}, tracker={tracker_liquidity}, error={percentage_error:.2f}%")
+        
+        except Exception as e:
+            logger.error(f"Error validating liquidity tracker: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
 async def main():
     """
