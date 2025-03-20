@@ -569,9 +569,6 @@ class Uniswap(BaseExchange):
         if hasattr(self, 'liquidity_tracker') and self.liquidity_tracker is not None:
             self.liquidity_tracker.update_pool_state(self.tick, self.sqrt_price)
             logger.info(f"Updated liquidity tracker state: tick={self.tick}, sqrtPriceX96={self.sqrt_price}")
-            
-            # Validate the liquidity tracker against the event liquidity
-            self.validate_liquidity_tracker(self.liquidity)
         
         sqrt_price_lower, sqrt_price_upper = self.get_sqrt_price_x96_boundaries(self.tick)
         lower_tick, upper_tick = self.get_tick_boundaries(self.tick)
@@ -684,13 +681,11 @@ class Uniswap(BaseExchange):
             
             # Now start handling all subscriptions with a single handler
             logger.info("Starting to handle all WebSocket subscriptions")
-            await self.w3_ws.subscription_manager.handle_subscriptions()
+            asyncio.create_task(self.w3_ws.subscription_manager.handle_subscriptions())
             
         except Exception as e:
             logger.error(f"Error in event listener setup: {e}")
             logger.error(traceback.format_exc())
-            # Fall back to polling for balances if needed
-            asyncio.create_task(self._balance_update_loop())
     
     async def setup_pool_event_subscriptions(self):
         """
@@ -868,9 +863,6 @@ class Uniswap(BaseExchange):
         except Exception as e:
             logger.error(f"Error in balance subscription: {e}")
             logger.error(traceback.format_exc())
-            # Fall back to polling method if subscription fails
-            logger.info("Falling back to polling method for balance updates")
-            asyncio.create_task(self._balance_update_loop())
     
     async def setup_eth_balance_subscription(self):
         """
@@ -915,9 +907,6 @@ class Uniswap(BaseExchange):
         except Exception as e:
             logger.error(f"Error setting up ETH balance subscription: {e}")
             logger.error(traceback.format_exc())
-            # Fall back to polling as a backup
-            logger.info("Falling back to polling method for ETH balance updates")
-            asyncio.create_task(self._eth_balance_check_loop())
             
     async def _eth_balance_check_loop(self):
         """
@@ -2089,60 +2078,6 @@ class Uniswap(BaseExchange):
             logger.error(traceback.format_exc())
             self.liquidity_tracker = None
             return False
-
-    def validate_liquidity_tracker(self, event_liquidity):
-        """
-        Validate the liquidity tracker against the event liquidity.
-        
-        This compares the active liquidity from the liquidity tracker with
-        the liquidity reported in the swap event to ensure our tracking is accurate.
-        
-        Args:
-            event_liquidity: The liquidity value from the swap event
-        """
-        # Skip validation if liquidity tracker is not initialized
-        if not hasattr(self, 'liquidity_tracker') or self.liquidity_tracker is None:
-            logger.warning("Cannot validate liquidity tracker - not initialized")
-            return
-            
-        try:
-            # Get the active liquidity from the tracker
-            tracker_liquidity = self.liquidity_tracker.get_active_liquidity()
-            
-            # Skip validation if either liquidity is zero
-            if event_liquidity == 0 or tracker_liquidity == 0:
-                logger.info(f"Skipping liquidity validation - event: {event_liquidity}, tracker: {tracker_liquidity}")
-                return
-                
-            # Calculate percentage error
-            percentage_error = abs(event_liquidity - tracker_liquidity) / max(event_liquidity, tracker_liquidity) * 100
-            
-            # Log the comparison results
-            if percentage_error > 1:
-                logger.warning(f"Liquidity tracker validation failed: event={event_liquidity}, tracker={tracker_liquidity}, error={percentage_error:.2f}%")
-                
-                # Log additional debug information about active positions
-                active_positions = []
-                for (tick_lower, tick_upper), total_liquidity in self.liquidity_tracker.range_totals.items():
-                    if tick_lower <= self.tick <= tick_upper:
-                        active_positions.append({
-                            "range": (tick_lower, tick_upper),
-                            "liquidity": total_liquidity,
-                            "owner_count": len(self.liquidity_tracker.positions[(tick_lower, tick_upper)])
-                        })
-                
-                # Log the details of the active positions for debugging
-                if active_positions:
-                    logger.info(f"Active positions ({len(active_positions)}): {active_positions[:3]}...")
-                else:
-                    logger.warning("No active positions found in liquidity tracker!")
-            else:
-                logger.info(f"Liquidity tracker validation passed: event={event_liquidity}, tracker={tracker_liquidity}, error={percentage_error:.2f}%")
-        
-        except Exception as e:
-            logger.error(f"Error validating liquidity tracker: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
 
 async def main():
     """

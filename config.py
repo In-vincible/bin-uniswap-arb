@@ -16,6 +16,7 @@ class Config:
     infura_ws_url: str = ""
     wallet_private_key: str = ""
     blocknative_api_key: str = ""
+    uniswap_subgraph_api_key: str = ""
 
     def __post_init__(self):
         """Load API keys and URLs from config file after initialization"""
@@ -32,6 +33,7 @@ class Config:
                 self.arb_config = config['arb_config']
                 self.blocknative_api_key = config.get('blocknative_api_key')
                 self.disable_network_level_validations = config.get('disable_network_level_validations', False)
+                self.uniswap_subgraph_api_key = config.get('uniswap_subgraph_api_key')
         except Exception as e:
             logging.error(f"Error loading config.json: {e}")
             logging.error(f"Please add config.json to the root directory with appropriate API keys and configuration as described in the README")
