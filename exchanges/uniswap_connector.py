@@ -624,32 +624,6 @@ class Uniswap(BaseExchange):
             logger.error(f"Error processing event: {e}")
             logger.error(traceback.format_exc())
     
-    async def start_listening_chain_events(self):
-        """
-        Start listening for relevant pool events.
-        """
-        try:
-            await self._initialize_ws_connection()
-            logger.info(f'Subscribing to {", ".join(self.get_relevant_pool_events().keys())} topics on {self.pool_address}')
-            
-            # Create the subscription
-            pool_subscription = LogsSubscription(
-                label='pool_subscription',
-                address=self.pool_address,  
-                topics=[list(self.get_relevant_pool_events().values())],
-                handler=self.process_event
-            )
-            
-            subscription_id = await self.w3_ws.subscription_manager.subscribe([pool_subscription])
-            logger.info(f'Pool subscription ID: {subscription_id}')
-            
-            # Handle subscriptions (this is a long-running task)
-            await self.w3_ws.subscription_manager.handle_subscriptions()
-            
-        except Exception as e:
-            logger.error(f"Error in event listener: {e}")
-            logger.error(traceback.format_exc())
-
     async def start_event_listener(self):
         """
         Start the event listener for pool events and balance changes.
@@ -774,7 +748,7 @@ class Uniswap(BaseExchange):
                 handler=self.process_token1_transfer
             )
             
-            # Subscribe to all balance events (excluding ETH for now)
+            # Subscribe to all balance events 
             subscriptions = [
                 token0_subscription,
                 token0_receive_subscription,
@@ -786,9 +760,8 @@ class Uniswap(BaseExchange):
             subscription_ids = await self.w3_ws.subscription_manager.subscribe(subscriptions)
             logger.info(f"Balance subscription IDs: {subscription_ids}")
             
-            # Start a separate task to periodically check ETH balance
-            # since we can't use BlockSubscription
-            asyncio.create_task(self._eth_balance_check_loop())
+            # Add newHeads subscription for ETH balance monitoring
+            await self.setup_eth_balance_subscription()
             
             # Note: We don't handle subscriptions here as it's handled in start_event_listener()
             
@@ -798,14 +771,60 @@ class Uniswap(BaseExchange):
             # Fall back to polling method if subscription fails
             logger.info("Falling back to polling method for balance updates")
             asyncio.create_task(self._balance_update_loop())
+    
+    async def setup_eth_balance_subscription(self):
+        """
+        Set up a newHeads subscription to monitor ETH balance changes.
+        
+        This subscribes to new block headers and checks if the ETH balance 
+        has changed whenever a new block is mined.
+        """
+        try:
+            logger.info("Setting up ETH balance subscription via newHeads")
+            
+            # Create a custom handler for new blocks
+            async def new_block_handler(block_header):
+                try:
+                    # Get the current ETH balance
+                    current_eth_balance = await self.async_w3.eth.get_balance(self.account.address)
+                    eth_balance = current_eth_balance / (10 ** self.metadata['ETH'].decimals)
+                    
+                    # Check if the balance has changed significantly (allow for small floating point differences)
+                    if 'eth' not in self.balances or abs(self.balances['eth'] - eth_balance) > 1e-10:
+                        old_balance = self.balances.get('eth', 0)
+                        # Update the balance cache
+                        self.balances['eth'] = eth_balance
+                        
+                        # Calculate and log the change
+                        change = eth_balance - old_balance
+                        direction = "increased" if change > 0 else "decreased"
+                        
+                        # Log the updated balance with block info
+                        logger.info(f"ETH balance {direction} by {abs(change):.8f} ETH in block {block_header['number']}. New balance: {eth_balance:.8f} ETH")
+                        
+                except Exception as e:
+                    logger.error(f"Error processing new block for ETH balance check: {e}")
+                    logger.error(traceback.format_exc())
+            
+            # Subscribe to newHeads (new block headers)
+            # This requires an alternate subscription approach since it's not a logs subscription
+            subscription_id = await self.w3_ws.eth.subscribe("newHeads", new_block_handler)
+            
+            logger.info(f"ETH balance subscription ID (newHeads): {subscription_id}")
+            
+        except Exception as e:
+            logger.error(f"Error setting up ETH balance subscription: {e}")
+            logger.error(traceback.format_exc())
+            # Fall back to polling as a backup
+            logger.info("Falling back to polling method for ETH balance updates")
+            asyncio.create_task(self._eth_balance_check_loop())
             
     async def _eth_balance_check_loop(self):
         """
         Periodically check ETH balance to detect changes.
-        This is used as an alternative to BlockSubscription.
+        This is used as an alternative to WebSocket subscription if that fails.
         """
         try:
-            last_eth_balance = 0
             check_interval = 5  # Check every 5 seconds
             
             while True:
@@ -815,11 +834,16 @@ class Uniswap(BaseExchange):
                 
                 # Check if the balance has changed
                 if 'eth' not in self.balances or abs(self.balances['eth'] - eth_balance) > 1e-10:
+                    old_balance = self.balances.get('eth', 0)
                     # Update the balance cache
                     self.balances['eth'] = eth_balance
                     
+                    # Calculate and log the change
+                    change = eth_balance - old_balance
+                    direction = "increased" if change > 0 else "decreased"
+                    
                     # Log the updated balance
-                    logger.info(f"ETH balance updated: {eth_balance}")
+                    logger.info(f"ETH balance {direction} by {abs(change):.8f} ETH (polling). New balance: {eth_balance:.8f} ETH")
                 
                 await asyncio.sleep(check_interval)
                 
@@ -907,29 +931,6 @@ class Uniswap(BaseExchange):
             logger.error(f"Error processing token1 transfer: {e}")
             logger.error(traceback.format_exc())
     
-    async def check_eth_balance_on_new_block(self, block_info):
-        """
-        Check ETH balance on each new block to detect changes.
-        
-        Args:
-            block_info: Information about the new block
-        """
-        try:
-            # Get the current ETH balance
-            current_eth_balance = await self.async_w3.eth.get_balance(self.account.address)
-            eth_balance = current_eth_balance / (10 ** self.metadata['ETH'].decimals)
-            
-            # Check if the balance has changed
-            if 'eth' not in self.balances or self.balances['eth'] != eth_balance:
-                # Update the balance cache
-                self.balances['eth'] = eth_balance
-                
-                # Log the updated balance
-                logger.info(f"ETH balance updated: {eth_balance}")
-                
-        except Exception as e:
-            logger.error(f"Error checking ETH balance: {e}")
-            logger.error(traceback.format_exc())
     
     async def get_deposit_address(self, instrument: str) -> str:
         """
