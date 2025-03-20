@@ -13,6 +13,7 @@ import traceback
 from config import Config
 from exchanges.base_connector import BaseExchange
 from token_monitoring import TokenMonitor
+from liquidity_tracker_v3 import LiquidityTracker
 
 logging.basicConfig(
     level=logging.INFO,
@@ -119,6 +120,10 @@ class Uniswap(BaseExchange):
         Initialize the Uniswap connector.
         """
         self.metadata = await self.load_metadata()
+        
+        # Initialize the liquidity tracker
+        await self._initialize_liquidity_tracker()
+        
         self.token_monitor = TokenMonitor(
             token_addresses=[self.metadata['token0'].address, self.metadata['token1'].address],
             infura_url=self.infura_url,
@@ -502,37 +507,71 @@ class Uniswap(BaseExchange):
     def process_mint(self, event):
         """
         Process a mint event.
+        
+        This adds liquidity to a specific tick range.
         """
         mint_event = self.pool_contract.events.Mint().process_log(event)
-        tick_lower = mint_event.args.tickLower
-        tick_upper = mint_event.args.tickUpper
+        tick_lower = int(mint_event.args.tickLower)
+        tick_upper = int(mint_event.args.tickUpper)
+        amount = int(mint_event.args.amount)
+        owner = mint_event.args.owner
+        
+        logger.info(f'Mint event: tickLower={tick_lower}, tickUpper={tick_upper}, amount={amount}, owner={owner}')
+        
+        # If the liquidity tracker is initialized, update it with the mint event
+        if hasattr(self, 'liquidity_tracker') and self.liquidity_tracker is not None:
+            self.liquidity_tracker.add_position(tick_lower, tick_upper, amount, owner)
+            logger.info(f"Added position to liquidity tracker: ({tick_lower}, {tick_upper}) owner={owner}, amount={amount}")
+        
+        # Check if the mint is within current tick boundaries
         if tick_lower <= self.tick and tick_upper >= self.tick:
-            self.liquidity += mint_event.args.amount
-            logger.info(f'liquidity: {self.liquidity}')
+            self.liquidity += amount
+            logger.info(f'Increased active liquidity by {amount}. New total: {self.liquidity}')
         else:
-            logger.info(f"Mint event is not within the tick boundaries: {tick_lower} <= {self.tick} <= {tick_upper}")
+            logger.info(f"Mint event is not within the active tick boundaries: {tick_lower} <= {self.tick} <= {tick_upper}")
     
     def process_burn(self, event):
         """
         Process a burn event.
+        
+        This removes liquidity from a specific tick range.
         """
         burn_event = self.pool_contract.events.Burn().process_log(event)
-        tick_lower = burn_event.args.tickLower
-        tick_upper = burn_event.args.tickUpper
-        if tick_lower <= self.tick and tick_upper >= self.tick:
-            self.liquidity -= burn_event.args.amount
-            logger.info(f'liquidity: {self.liquidity}')
-        else:
-            logger.info(f"Burn event is not within the tick boundaries: {tick_lower} <= {self.tick} <= {tick_upper}")
+        tick_lower = int(burn_event.args.tickLower)
+        tick_upper = int(burn_event.args.tickUpper)
+        amount = int(burn_event.args.amount)
+        owner = burn_event.args.owner
         
+        logger.info(f'Burn event: tickLower={tick_lower}, tickUpper={tick_upper}, amount={amount}, owner={owner}')
+        
+        # If the liquidity tracker is initialized, update it with the burn event
+        if hasattr(self, 'liquidity_tracker') and self.liquidity_tracker is not None:
+            self.liquidity_tracker.remove_position(tick_lower, tick_upper, amount, owner)
+            logger.info(f"Removed position from liquidity tracker: ({tick_lower}, {tick_upper}) owner={owner}, amount={amount}")
+        
+        # Check if the burn is within current tick boundaries (affects active liquidity)
+        if tick_lower <= self.tick and tick_upper >= self.tick:
+            self.liquidity -= amount
+            logger.info(f'Decreased active liquidity by {amount}. New total: {self.liquidity}')
+        else:
+            logger.info(f"Burn event is not within the active tick boundaries: {tick_lower} <= {self.tick} <= {tick_upper}")
+    
     def process_swaps(self, event):
         """
         Process a swap event.
         """
         swap_event = self.pool_contract.events.Swap().process_log(event)
-        self.liquidity = swap_event.args.liquidity
-        self.sqrt_price = swap_event.args.sqrtPriceX96
-        self.tick = swap_event.args.tick
+        self.liquidity = int(swap_event.args.liquidity)
+        self.sqrt_price = int(swap_event.args.sqrtPriceX96)
+        self.tick = int(swap_event.args.tick)
+        
+        # Update the liquidity tracker with the new tick and sqrt price
+        if hasattr(self, 'liquidity_tracker') and self.liquidity_tracker is not None:
+            self.liquidity_tracker.update_pool_state(self.tick, self.sqrt_price)
+            logger.info(f"Updated liquidity tracker state: tick={self.tick}, sqrtPriceX96={self.sqrt_price}")
+            
+            # Validate the liquidity tracker against the event liquidity
+            self.validate_liquidity_tracker(self.liquidity)
         
         sqrt_price_lower, sqrt_price_upper = self.get_sqrt_price_x96_boundaries(self.tick)
         lower_tick, upper_tick = self.get_tick_boundaries(self.tick)
@@ -663,11 +702,21 @@ class Uniswap(BaseExchange):
             # Get the event topics and ensure they have 0x prefix
             event_topics = list(self.get_relevant_pool_events().values())
             
-            # Create the subscription for pool events
+            # Check if we need to process historical events first
+            if hasattr(self, 'latest_block_number') and self.latest_block_number is not None:
+                # Fetch historical events from last synced block to latest
+                latest_block = await self.async_w3.eth.block_number
+                start_block = self.latest_block_number + 1
+                
+                if start_block < latest_block:
+                    logger.info(f"Fetching historical events from block {start_block} to {latest_block}")
+                    await self._fetch_historical_events(start_block, latest_block)
+            
+            # Create the subscription for pool events (websocket subscriptions only work for new events)
             pool_subscription = LogsSubscription(
                 label='pool_subscription',
                 address=self.pool_address,  
-                topics=[event_topics],  # This is correct - we need a list within a list for "or" condition
+                topics=[event_topics],
                 handler=self.process_event
             )
             
@@ -679,6 +728,57 @@ class Uniswap(BaseExchange):
             logger.error(f"Error setting up pool event subscriptions: {e}")
             logger.error(traceback.format_exc())
 
+    async def _fetch_historical_events(self, from_block, to_block):
+        """
+        Fetch historical events between specified blocks and process them.
+        
+        Args:
+            from_block: Starting block number
+            to_block: Ending block number
+        """
+        try:
+            logger.info(f"Fetching historical events from block {from_block} to {to_block}")
+            
+            # Get the event topics
+            event_map = self.get_relevant_pool_events()
+            event_topics = list(event_map.values())
+            
+            # Create filter for logs
+            logs_filter = {
+                'address': self.pool_address,
+                'fromBlock': from_block,
+                'toBlock': to_block,
+                'topics': [event_topics]  # First argument is an array of topics to match any of them
+            }
+            
+            # Fetch logs
+            logs = await self.async_w3.eth.get_logs(logs_filter)
+            logger.info(f"Found {len(logs)} historical events to process")
+            
+            # Process each event
+            for log in logs:
+                try:
+                    # We need to determine event type based on the topic
+                    topic = log['topics'][0].hex()
+                    
+                    if topic == self.mint_topic:
+                        logger.info(f"Processing historical Mint event at block {log['blockNumber']}")
+                        self.process_mint(log)
+                    elif topic == self.burn_topic:
+                        logger.info(f"Processing historical Burn event at block {log['blockNumber']}")
+                        self.process_burn(log)
+                    elif topic == self.swap_topic:
+                        logger.info(f"Processing historical Swap event at block {log['blockNumber']}")
+                        self.process_swaps(log)
+                    else:
+                        logger.warning(f"Unknown event topic: {topic}")
+                except Exception as e:
+                    logger.error(f"Error processing historical event: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Error fetching historical events: {e}")
+            logger.error(traceback.format_exc())
+    
     async def start_balance_subscription(self):
         """
         Subscribe to token balance changes via Transfer events on WebSocket.
@@ -1516,18 +1616,121 @@ class Uniswap(BaseExchange):
     
     async def _compute_slippage_cost(self, asset: str, amount: float, direction: str) -> float:
         """
-        Compute the slippage cost in basis points (bps) for a specific asset and amount.
+        Compute the slippage cost for a given amount and direction.
         
-        This calculates the price impact of executing a trade of the given size by comparing
-        the effective execution price to the current market price.
+        This uses the liquidity tracker to simulate swaps across multiple ticks,
+        providing a more accurate slippage estimate for larger trades.
         
         Args:
-            asset (str): Asset symbol to compute slippage for
-            amount (float): Amount of asset to trade
-            direction (str): Trade direction - either 'buy' or 'sell'
+            asset: The asset to swap ('token0' or 'token1')
+            amount: The amount of asset to swap (in asset units)
+            direction: 'buy' or 'sell'
             
         Returns:
             float: Slippage cost in basis points (bps). Positive values indicate worse prices.
+        """
+        # Check if liquidity tracker is initialized
+        if not hasattr(self, 'liquidity_tracker') or self.liquidity_tracker is None:
+            logger.warning("Liquidity tracker not initialized, falling back to simple slippage estimate")
+            return await self._compute_simple_slippage_cost(asset, amount, direction)
+            
+        try:
+            # Get current market price from sqrt price
+            token0_price, token1_price = self.compute_price_from_sqrt_price_x96()
+            current_market_price = token1_price  # Standard quote is token0 per token1
+            
+            # Determine token symbols for clarity
+            token0_symbol = self.metadata['token0'].symbol
+            token1_symbol = self.metadata['token1'].symbol
+            
+            # Convert to decimal amounts based on token decimals
+            token0_decimals = self.metadata['token0'].decimals
+            token1_decimals = self.metadata['token1'].decimals
+            
+            is_token0 = (asset == token0_symbol)
+            
+            logger.info(f"Computing slippage for {amount} {asset}, direction: {direction}")
+            logger.info(f"Current price: {current_market_price} {token0_symbol}/{token1_symbol}")
+            
+            if is_token0:
+                # Trading token0
+                if direction == 'buy':
+                    # Buying token0, selling token1
+                    # First, estimate how much token1 we need to swap for the desired token0
+                    # This is a rough estimate using the current price
+                    estimated_token1_amount = amount * current_market_price
+                    
+                    # Simulate the swap
+                    token0_out, token1_in, _ = self.liquidity_tracker.simulate_upward_swap(estimated_token1_amount)
+                    
+                    # Calculate effective price
+                    if token0_out > 0:
+                        effective_price = token1_in / token0_out
+                        slippage_bps = ((effective_price / current_market_price) - 1) * 10_000
+                        logger.info(f"Simulated buying {token0_out} {token0_symbol} for {token1_in} {token1_symbol}")
+                        logger.info(f"Effective price: {effective_price}, slippage: {slippage_bps} bps")
+                        return slippage_bps
+                else:
+                    # Selling token0, buying token1
+                    token1_out, token0_in, _ = self.liquidity_tracker.simulate_downward_swap(amount)
+                    
+                    if token1_out > 0:
+                        effective_price = token0_in / token1_out  # Inverse of what we want
+                        inverse_effective_price = 1 / effective_price if effective_price > 0 else 0
+                        slippage_bps = (1 - (inverse_effective_price / current_market_price)) * 10_000
+                        logger.info(f"Simulated selling {token0_in} {token0_symbol} for {token1_out} {token1_symbol}")
+                        logger.info(f"Effective price: {inverse_effective_price}, slippage: {slippage_bps} bps")
+                        return slippage_bps
+            else:
+                # Trading token1
+                if direction == 'buy':
+                    # Buying token1, selling token0
+                    estimated_token0_amount = amount / current_market_price
+                    
+                    token1_out, token0_in, _ = self.liquidity_tracker.simulate_downward_swap(estimated_token0_amount)
+                    
+                    if token1_out > 0:
+                        effective_price = token0_in / token1_out
+                        inverse_effective_price = 1 / effective_price if effective_price > 0 else 0
+                        slippage_bps = (1 - (inverse_effective_price / current_market_price)) * 10_000
+                        logger.info(f"Simulated buying {token1_out} {token1_symbol} for {token0_in} {token0_symbol}")
+                        logger.info(f"Effective price: {inverse_effective_price}, slippage: {slippage_bps} bps")
+                        return slippage_bps
+                else:
+                    # Selling token1, buying token0
+                    token0_out, token1_in, _ = self.liquidity_tracker.simulate_upward_swap(amount)
+                    
+                    if token0_out > 0:
+                        effective_price = token1_in / token0_out
+                        slippage_bps = ((effective_price / current_market_price) - 1) * 10_000
+                        logger.info(f"Simulated selling {token1_in} {token1_symbol} for {token0_out} {token0_symbol}")
+                        logger.info(f"Effective price: {effective_price}, slippage: {slippage_bps} bps")
+                        return slippage_bps
+            
+            # If we get here, something went wrong with the simulation
+            logger.error("Failed to compute slippage, falling back to simple estimate")
+            return await self._compute_simple_slippage_cost(asset, amount, direction)
+            
+        except Exception as e:
+            logger.error(f"Error computing slippage: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return await self._compute_simple_slippage_cost(asset, amount, direction)
+    
+    async def _compute_simple_slippage_cost(self, asset: str, amount: float, direction: str) -> float:
+        """
+        Simple slippage cost computation using tick boundary estimates.
+        
+        This is the original implementation that only considers liquidity within the current tick.
+        Used as a fallback when the liquidity tracker is not available.
+        
+        Args:
+            asset: The asset to swap
+            amount: The amount to swap
+            direction: 'buy' or 'sell'
+            
+        Returns:
+            float: Slippage cost in basis points
         """
         # Get current market price from sqrt price
         token0_price, token1_price = self.compute_price_from_sqrt_price_x96()
@@ -1825,6 +2028,121 @@ class Uniswap(BaseExchange):
             logger.error(f"Error unwrapping {asset}: {str(e)}")
             logger.error(traceback.format_exc())
             return 0
+
+    async def _initialize_liquidity_tracker(self):
+        """
+        Initialize the liquidity tracker with the current pool state and historical positions.
+        
+        This method:
+        1. Creates a LiquidityTracker instance with current tick and sqrtPriceX96
+        2. Fetches historical positions from the subgraph
+        3. Registers the tracker for use in processing events
+        """
+        from liquidity_tracker_v3 import LiquidityTracker
+        
+        logger.info(f"Initializing liquidity tracker for pool {self.pool_address}")
+        
+        try:
+            # Create a liquidity tracker with the current tick and sqrt price
+            self.liquidity_tracker = LiquidityTracker(
+                current_tick=self.tick,
+                current_sqrtPriceX96=self.sqrt_price
+            )
+            
+            # Initialize from subgraph data
+            min_liquidity = 1  # Filter out zero liquidity positions
+            success = await self.liquidity_tracker.init_from_subgraph(
+                pool_id=self.pool_address,
+                min_liquidity=min_liquidity
+            )
+            
+            if success:
+                # Get sync block info for debugging
+                sync_info = self.liquidity_tracker.get_sync_block_info()
+                logger.info(f"Liquidity tracker initialized from subgraph at block #{sync_info['number']}")
+                
+                # Validate the tracker against current on-chain liquidity
+                current_liquidity = self.liquidity
+                tracker_liquidity = self.liquidity_tracker.get_active_liquidity()
+                
+                # Calculate percentage error
+                if current_liquidity > 0 and tracker_liquidity > 0:
+                    percentage_error = abs(current_liquidity - tracker_liquidity) / max(current_liquidity, tracker_liquidity) * 100
+                    logger.info(f"Initial validation - On-chain: {current_liquidity}, Tracker: {tracker_liquidity}, Error: {percentage_error:.2f}%")
+                else:
+                    logger.info(f"Initial validation - On-chain: {current_liquidity}, Tracker: {tracker_liquidity} (skipping percentage calculation)")
+                
+                # Log total unique positions
+                position_count = len(self.liquidity_tracker.positions)
+                owner_position_count = sum(len(owners) for owners in self.liquidity_tracker.positions.values())
+                logger.info(f"Tracking {position_count} unique tick ranges with {owner_position_count} owner-position combinations")
+                
+                return True
+            else:
+                logger.error("Failed to initialize liquidity tracker from subgraph")
+                self.liquidity_tracker = None
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error initializing liquidity tracker: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            self.liquidity_tracker = None
+            return False
+
+    def validate_liquidity_tracker(self, event_liquidity):
+        """
+        Validate the liquidity tracker against the event liquidity.
+        
+        This compares the active liquidity from the liquidity tracker with
+        the liquidity reported in the swap event to ensure our tracking is accurate.
+        
+        Args:
+            event_liquidity: The liquidity value from the swap event
+        """
+        # Skip validation if liquidity tracker is not initialized
+        if not hasattr(self, 'liquidity_tracker') or self.liquidity_tracker is None:
+            logger.warning("Cannot validate liquidity tracker - not initialized")
+            return
+            
+        try:
+            # Get the active liquidity from the tracker
+            tracker_liquidity = self.liquidity_tracker.get_active_liquidity()
+            
+            # Skip validation if either liquidity is zero
+            if event_liquidity == 0 or tracker_liquidity == 0:
+                logger.info(f"Skipping liquidity validation - event: {event_liquidity}, tracker: {tracker_liquidity}")
+                return
+                
+            # Calculate percentage error
+            percentage_error = abs(event_liquidity - tracker_liquidity) / max(event_liquidity, tracker_liquidity) * 100
+            
+            # Log the comparison results
+            if percentage_error > 1:
+                logger.warning(f"Liquidity tracker validation failed: event={event_liquidity}, tracker={tracker_liquidity}, error={percentage_error:.2f}%")
+                
+                # Log additional debug information about active positions
+                active_positions = []
+                for (tick_lower, tick_upper), total_liquidity in self.liquidity_tracker.range_totals.items():
+                    if tick_lower <= self.tick <= tick_upper:
+                        active_positions.append({
+                            "range": (tick_lower, tick_upper),
+                            "liquidity": total_liquidity,
+                            "owner_count": len(self.liquidity_tracker.positions[(tick_lower, tick_upper)])
+                        })
+                
+                # Log the details of the active positions for debugging
+                if active_positions:
+                    logger.info(f"Active positions ({len(active_positions)}): {active_positions[:3]}...")
+                else:
+                    logger.warning("No active positions found in liquidity tracker!")
+            else:
+                logger.info(f"Liquidity tracker validation passed: event={event_liquidity}, tracker={tracker_liquidity}, error={percentage_error:.2f}%")
+        
+        except Exception as e:
+            logger.error(f"Error validating liquidity tracker: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
 async def main():
     """
