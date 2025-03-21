@@ -1657,7 +1657,7 @@ class Uniswap(BaseExchange):
         )
 
         # Calculate the effective price and slippage
-        market_price = self.get_current_price(asset)
+        market_price = await self.get_current_price(asset)
         
         if total_output > 0:
             # Calculate effective price based on swap direction and tokens
