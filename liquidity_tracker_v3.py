@@ -319,49 +319,127 @@ class LiquidityTracker:
             # Return total liquidity for this range
             return self.range_totals[key]
     
-    def simulate_swap(self, amount_in_token0: float, direction: str = 'upward') -> Tuple[float, int]:
+    def simulate_swap(self, amount_in: float, direction: str = 'upward', is_token0_in: bool = True) -> Tuple[float, int]:
         """
         Simulate a swap across multiple ticks using a tick-by-tick approach.
         
         Args:
-            amount_in_token0: Amount of token0 to swap (in token0 units)
-            direction: 'upward' for selling token1 to buy token0, 'downward' for the opposite
+            amount_in: Amount of input token to swap
+            direction: 'upward' for token0 -> token1, 'downward' for token1 -> token0
+            is_token0_in: If True, amount_in is denominated in token0, otherwise token1
             
         Returns:
-            Tuple of (total_dy_out, ending_tick) where:
-            - total_dy_out: Total amount of token1 received (in token1 units)
+            Tuple of (total_output, ending_tick) where:
+            - total_output: Total amount of output token received (token1 for upward, token0 for downward)
             - ending_tick: The final tick after the swap
         """
         if self.current_tick is None or self.current_sqrtPriceX96 is None:
             logger.warning("Current tick or sqrtPriceX96 is not set; cannot simulate swap.")
             return 0.0, 0
 
-        amount_remaining = amount_in_token0
+        # Set initial values based on current pool state
         sqrtP = self.current_sqrtPriceX96
         L = self.get_active_liquidity()
         tick = self.current_tick
-        total_dy_out = 0.0
-
-        while amount_remaining > 0:
-            sqrtP_next = self.sqrt_price_at_next_tick(tick + 1)
-            dx_max = L * (1/sqrtP - 1/sqrtP_next)
-
-            if amount_remaining < dx_max:
-                sqrtP_new = 1 / (1/sqrtP - amount_remaining / L)
-                dy = L * (sqrtP_new - sqrtP)
-                sqrtP = sqrtP_new
-                amount_remaining = 0
-            else:
-                dy = L * (sqrtP_next - sqrtP)
-                amount_remaining -= dx_max
-                sqrtP = sqrtP_next
-                tick += 1
-                L += self.tick_liquidity_delta(tick)
-
-            total_dy_out += dy
-
-        logger.info(f"Completed swap: total_dy_out={total_dy_out}, ending_tick={tick}")
-        return total_dy_out, tick
+        total_output = 0.0
+        
+        # If liquidity is 0, we can't perform the swap
+        if L <= 0:
+            logger.warning(f"No active liquidity at current tick {tick}")
+            return 0.0, tick
+        
+        # Convert amount_in to the expected input token (token0 for upward, token1 for downward)
+        amount_remaining = amount_in
+        
+        # Check if we need to convert the input amount
+        if direction == 'upward' and not is_token0_in:
+            # Input is token1 but upward direction expects token0
+            # Use the current sqrtP to convert from token1 to token0
+            amount_remaining = amount_in / (sqrtP / (2**96))**2
+            logger.debug(f"Converting input from token1 ({amount_in}) to token0 ({amount_remaining})")
+        elif direction == 'downward' and is_token0_in:
+            # Input is token0 but downward direction expects token1
+            # Use the current sqrtP to convert from token0 to token1
+            amount_remaining = amount_in * (sqrtP / (2**96))**2
+            logger.debug(f"Converting input from token0 ({amount_in}) to token1 ({amount_remaining})")
+        
+        logger.debug(f"Starting swap simulation: direction={direction}, original_amount_in={amount_in}, "
+                    f"converted_amount_in={amount_remaining}, is_token0_in={is_token0_in}, "
+                    f"starting_tick={tick}, starting_sqrtP={sqrtP}, starting_liquidity={L}")
+        
+        # Simulate the swap
+        if direction == 'upward':
+            # Selling token0 to buy token1 (upward price movement)
+            while amount_remaining > 0:
+                # Calculate sqrt price at next tick
+                sqrtP_next = self.sqrt_price_at_next_tick(tick + 1)
+                
+                # Calculate max amount of token0 that can be swapped in this tick range
+                dx_max = L * (1/(sqrtP/(2**96)) - 1/(sqrtP_next/(2**96)))
+                
+                if amount_remaining <= dx_max:
+                    # We can complete the swap within this tick
+                    sqrtP_new = 1 / ((1/(sqrtP/(2**96))) - amount_remaining / L) * (2**96)
+                    dy = L * ((sqrtP_new/(2**96)) - (sqrtP/(2**96)))
+                    sqrtP = sqrtP_new
+                    amount_remaining = 0
+                    total_output += dy
+                    logger.debug(f"Swap completed within tick {tick}: dy={dy}, total_output={total_output}")
+                else:
+                    # Need to cross to the next tick
+                    dy = L * ((sqrtP_next/(2**96)) - (sqrtP/(2**96)))
+                    total_output += dy
+                    amount_remaining -= dx_max
+                    sqrtP = sqrtP_next
+                    tick += 1
+                    L += self.tick_liquidity_delta(tick)
+                    
+                    # If we've lost all liquidity, break the loop
+                    if L <= 0:
+                        logger.warning(f"Liquidity dropped to zero at tick {tick}, stopping simulation")
+                        break
+                    
+                    logger.debug(f"Crossed tick {tick}: dx={dx_max}, dy={dy}, new_liquidity={L}, remaining={amount_remaining}")
+        
+        elif direction == 'downward':
+            # Selling token1 to buy token0 (downward price movement)
+            while amount_remaining > 0:
+                # Calculate sqrt price at next lower tick
+                sqrtP_next = self.sqrt_price_at_next_tick(tick - 1)
+                
+                # Calculate max amount of token1 that can be swapped in this tick range
+                dy_max = L * ((sqrtP/(2**96)) - (sqrtP_next/(2**96)))
+                
+                if amount_remaining <= dy_max:
+                    # We can complete the swap within this tick
+                    sqrtP_new = (sqrtP/(2**96)) - amount_remaining / L * (2**96)
+                    dx = L * (1/(sqrtP_new/(2**96)) - 1/(sqrtP/(2**96)))
+                    sqrtP = sqrtP_new
+                    amount_remaining = 0
+                    total_output += dx
+                    logger.debug(f"Swap completed within tick {tick}: dx={dx}, total_output={total_output}")
+                else:
+                    # Need to cross to the previous tick
+                    dx = L * (1/(sqrtP_next/(2**96)) - 1/(sqrtP/(2**96)))
+                    total_output += dx
+                    amount_remaining -= dy_max
+                    sqrtP = sqrtP_next
+                    tick -= 1
+                    L -= self.tick_liquidity_delta(tick)  # Note: subtracting for downward movement
+                    
+                    # If we've lost all liquidity, break the loop
+                    if L <= 0:
+                        logger.warning(f"Liquidity dropped to zero at tick {tick}, stopping simulation")
+                        break
+                    
+                    logger.debug(f"Crossed tick {tick}: dy={dy_max}, dx={dx}, new_liquidity={L}, remaining={amount_remaining}")
+        
+        else:
+            logger.error(f"Invalid direction: {direction}. Must be 'upward' or 'downward'.")
+            return 0.0, tick
+        
+        logger.info(f"Completed swap: direction={direction}, total_output={total_output}, ending_tick={tick}")
+        return total_output, tick
 
     def sqrt_price_at_next_tick(self, tick: int) -> float:
         """
@@ -375,18 +453,39 @@ class LiquidityTracker:
         """
         return 1.0001 ** (tick / 2)
 
-    def tick_liquidity_delta(self, tick: int) -> float:
+    def tick_liquidity_delta(self, tick: int) -> int:
         """
         Calculate the change in liquidity at a given tick.
+        
+        This function determines the net liquidity change when crossing a tick boundary,
+        which is essential for accurate swap simulations across ticks. When crossing upward,
+        positions with lower tick equal to this tick become active, and positions with upper tick
+        equal to this tick become inactive. For downward crossing, the opposite occurs.
         
         Args:
             tick: The tick for which to calculate the liquidity change
             
         Returns:
-            The change in liquidity at the given tick
+            The net change in liquidity at the given tick (positive if net increase, negative if net decrease)
         """
-        # Placeholder implementation, should be replaced with actual logic
-        return 0.0
+        net_liquidity_change = 0
+        
+        # Iterate through all positions
+        for (tick_lower, tick_upper), liquidity in self.range_totals.items():
+            # Add liquidity for positions that become active at this tick
+            if tick_lower == tick:
+                net_liquidity_change += liquidity
+                logger.debug(f"Position ({tick_lower}, {tick_upper}) becomes active at tick {tick}, adding {liquidity}")
+            
+            # Subtract liquidity for positions that become inactive at this tick
+            if tick_upper == tick:
+                net_liquidity_change -= liquidity
+                logger.debug(f"Position ({tick_lower}, {tick_upper}) becomes inactive at tick {tick}, removing {liquidity}")
+        
+        if net_liquidity_change != 0:
+            logger.debug(f"Net liquidity change at tick {tick}: {net_liquidity_change}")
+        
+        return net_liquidity_change
     
     def calculate_effective_price(self, token0_amount: float, token1_amount: float) -> Tuple[float, float]:
         """
