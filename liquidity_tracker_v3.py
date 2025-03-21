@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import math
 import sys
 from typing import Optional, Dict, Tuple, List, Any
 from uniswap_subgraph import UniswapSubgraph
@@ -10,6 +11,7 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger("liquidity_tracker")
+TICK_BASE = float(1.0001)
 
 class LiquidityTracker:
     """
@@ -332,7 +334,7 @@ class LiquidityTracker:
         Returns:
             The sqrt price at the given tick
         """
-        return 1.0001 ** (tick / 2)
+        return math.pow(TICK_BASE, tick / 2)
     
     def get_next_tick(self, tick: int, direction: str = 'upward') -> int:
         """
