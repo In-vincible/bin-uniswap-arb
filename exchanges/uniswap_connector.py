@@ -2011,10 +2011,15 @@ class Uniswap(BaseExchange):
         logger.info(f"Initializing liquidity tracker for pool {self.pool_address}")
         
         try:
-            # Create a liquidity tracker with the current tick and sqrt price
+            # Get tick spacing from the pool contract if available
+            tick_spacing = self.tick_spacing if hasattr(self, 'tick_spacing') else 60
+            logger.info(f"Using tick spacing: {tick_spacing}")
+            
+            # Create a liquidity tracker with the current tick, sqrt price, and tick spacing
             self.liquidity_tracker = LiquidityTracker(
                 current_tick=self.tick,
-                current_sqrtPriceX96=self.sqrt_price
+                current_sqrtPriceX96=self.sqrt_price,
+                tick_spacing=tick_spacing
             )
             
             # Initialize from subgraph data

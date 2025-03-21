@@ -17,13 +17,14 @@ class LiquidityTracker:
     Also stores the current pool state (tick and sqrtPriceX96) for calculating active liquidity.
     Initializes from Uniswap subgraph data and tracks the last synced block for real-time event subscriptions.
     """
-    def __init__(self, current_tick: Optional[int] = None, current_sqrtPriceX96: Optional[int] = None):
+    def __init__(self, current_tick: Optional[int] = None, current_sqrtPriceX96: Optional[int] = None, tick_spacing: int = 60):
         """
         Initialize the LiquidityTracker.
         
         Args:
             current_tick: Current tick value for the pool (optional)
             current_sqrtPriceX96: Current sqrt price X96 value for the pool (optional)
+            tick_spacing: Tick spacing for the pool (defaults to 60 for 0.3% pools)
         """
         # Main positions data structure:
         # First key: (tickLower, tickUpper)
@@ -39,11 +40,13 @@ class LiquidityTracker:
         # Set current pool state
         self.current_tick = current_tick
         self.current_sqrtPriceX96 = current_sqrtPriceX96
+        self.tick_spacing = tick_spacing
         
         if current_tick is not None:
             logger.info(f"Initialized with current tick: {current_tick}")
         if current_sqrtPriceX96 is not None:
             logger.info(f"Initialized with current sqrtPriceX96: {current_sqrtPriceX96}")
+        logger.info(f"Initialized with tick spacing: {tick_spacing}")
         
         # Track subgraph data freshness and synchronization
         self.last_synced_block = None
@@ -319,6 +322,40 @@ class LiquidityTracker:
             # Return total liquidity for this range
             return self.range_totals[key]
     
+    def sqrt_price_at_next_tick(self, tick: int) -> float:
+        """
+        Calculate the sqrt price at the specified tick.
+        
+        Args:
+            tick: The tick for which to calculate the sqrt price
+            
+        Returns:
+            The sqrt price at the given tick
+        """
+        return 1.0001 ** (tick / 2)
+    
+    def get_next_tick(self, tick: int, direction: str = 'upward') -> int:
+        """
+        Get the next initialized tick in the specified direction, respecting tick spacing.
+        
+        Args:
+            tick: The current tick
+            direction: 'upward' or 'downward' direction
+            
+        Returns:
+            The next initialized tick in the specified direction
+        """
+        if direction == 'upward':
+            # Calculate the next tick upward based on tick spacing
+            next_tick = tick + self.tick_spacing
+            logger.debug(f"Moving to next tick upward: {tick} -> {next_tick} (spacing: {self.tick_spacing})")
+            return next_tick
+        else:
+            # Calculate the next tick downward based on tick spacing
+            next_tick = tick - self.tick_spacing
+            logger.debug(f"Moving to next tick downward: {tick} -> {next_tick} (spacing: {self.tick_spacing})")
+            return next_tick
+    
     def simulate_swap(self, amount_in: float, direction: str = 'upward', is_token0_in: bool = True) -> Tuple[float, int]:
         """
         Simulate a swap across multiple ticks using a tick-by-tick approach.
@@ -351,18 +388,6 @@ class LiquidityTracker:
         # Convert amount_in to the expected input token (token0 for upward, token1 for downward)
         amount_remaining = amount_in
         
-        # Check if we need to convert the input amount
-        if direction == 'upward' and not is_token0_in:
-            # Input is token1 but upward direction expects token0
-            # Use the current sqrtP to convert from token1 to token0
-            amount_remaining = amount_in / (sqrtP / (2**96))**2
-            logger.debug(f"Converting input from token1 ({amount_in}) to token0 ({amount_remaining})")
-        elif direction == 'downward' and is_token0_in:
-            # Input is token0 but downward direction expects token1
-            # Use the current sqrtP to convert from token0 to token1
-            amount_remaining = amount_in * (sqrtP / (2**96))**2
-            logger.debug(f"Converting input from token0 ({amount_in}) to token1 ({amount_remaining})")
-        
         logger.debug(f"Starting swap simulation: direction={direction}, original_amount_in={amount_in}, "
                     f"converted_amount_in={amount_remaining}, is_token0_in={is_token0_in}, "
                     f"starting_tick={tick}, starting_sqrtP={sqrtP}, starting_liquidity={L}")
@@ -371,8 +396,11 @@ class LiquidityTracker:
         if direction == 'upward':
             # Selling token0 to buy token1 (upward price movement)
             while amount_remaining > 0:
+                # Calculate next tick according to tick spacing
+                next_tick = self.get_next_tick(tick, 'upward')
+                
                 # Calculate sqrt price at next tick
-                sqrtP_next = self.sqrt_price_at_next_tick(tick + 1)
+                sqrtP_next = self.sqrt_price_at_next_tick(next_tick)
                 
                 # Calculate max amount of token0 that can be swapped in this tick range
                 dx_max = L * (1/(sqrtP/(2**96)) - 1/(sqrtP_next/(2**96)))
@@ -391,7 +419,7 @@ class LiquidityTracker:
                     total_output += dy
                     amount_remaining -= dx_max
                     sqrtP = sqrtP_next
-                    tick += 1
+                    tick = next_tick
                     L += self.tick_liquidity_delta(tick)
                     
                     # If we've lost all liquidity, break the loop
@@ -404,8 +432,11 @@ class LiquidityTracker:
         elif direction == 'downward':
             # Selling token1 to buy token0 (downward price movement)
             while amount_remaining > 0:
+                # Calculate next tick according to tick spacing
+                next_tick = self.get_next_tick(tick, 'downward')
+                
                 # Calculate sqrt price at next lower tick
-                sqrtP_next = self.sqrt_price_at_next_tick(tick - 1)
+                sqrtP_next = self.sqrt_price_at_next_tick(next_tick)
                 
                 # Calculate max amount of token1 that can be swapped in this tick range
                 dy_max = L * ((sqrtP/(2**96)) - (sqrtP_next/(2**96)))
@@ -424,7 +455,7 @@ class LiquidityTracker:
                     total_output += dx
                     amount_remaining -= dy_max
                     sqrtP = sqrtP_next
-                    tick -= 1
+                    tick = next_tick
                     L -= self.tick_liquidity_delta(tick)  # Note: subtracting for downward movement
                     
                     # If we've lost all liquidity, break the loop
@@ -440,18 +471,6 @@ class LiquidityTracker:
         
         logger.info(f"Completed swap: direction={direction}, total_output={total_output}, ending_tick={tick}")
         return total_output, tick
-
-    def sqrt_price_at_next_tick(self, tick: int) -> float:
-        """
-        Calculate the sqrt price at the next tick.
-        
-        Args:
-            tick: The tick for which to calculate the sqrt price
-            
-        Returns:
-            The sqrt price at the given tick
-        """
-        return 1.0001 ** (tick / 2)
 
     def tick_liquidity_delta(self, tick: int) -> int:
         """
