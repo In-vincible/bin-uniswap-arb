@@ -1605,106 +1605,105 @@ class Uniswap(BaseExchange):
     
     async def _compute_slippage_cost(self, asset: str, amount: float, direction: str) -> float:
         """
-        Compute the slippage cost for a given amount and direction.
+        Compute the slippage cost for a given amount of asset to swap.
         
-        This uses the liquidity tracker to simulate swaps across multiple ticks,
-        providing a more accurate slippage estimate for larger trades.
+        This method uses the LiquidityTracker to simulate a swap and calculate
+        the slippage in basis points based on the difference between the effective
+        price and the current market price.
         
         Args:
-            asset: The asset to swap ('token0' or 'token1')
-            amount: The amount of asset to swap (in asset units)
+            asset: The asset to swap (e.g., 'ETH', 'USDC')
+            amount: The amount of asset to swap
             direction: 'buy' or 'sell'
             
         Returns:
-            float: Slippage cost in basis points (bps). Positive values indicate worse prices.
+            The slippage cost in basis points.
         """
-        # Check if liquidity tracker is initialized
+        # Check if we have a liquidity tracker initialized
         if not hasattr(self, 'liquidity_tracker') or self.liquidity_tracker is None:
-            logger.warning("Liquidity tracker not initialized, falling back to simple slippage estimate")
+            logger.warning("Liquidity tracker not initialized, falling back to simple slippage calculation")
             return await self._compute_simple_slippage_cost(asset, amount, direction)
-            
+        
+        # Get the current tick and liquidity tracker
+        liquidity_tracker = self.liquidity_tracker
+        current_tick = liquidity_tracker.current_tick
+        
+        if current_tick is None:
+            logger.warning("Current tick is not set in liquidity tracker, falling back to simple slippage calculation")
+            return await self._compute_simple_slippage_cost(asset, amount, direction)
+        
+        # Get the current market price
+        market_price = self.get_market_price(asset)
+        
+        logger.info(f"Computing slippage for {amount} {asset} ({direction}) at market price {market_price:.6f}")
+        
         try:
-            # Get current market price from sqrt price
-            token0_price, token1_price = self.compute_price_from_sqrt_price_x96()
-            current_market_price = token1_price  # Standard quote is token0 per token1
+            # Determine tokens based on direction and asset
+            is_token0 = asset == self.metadata['token0'].symbol
+            is_token1 = asset == self.metadata['token1'].symbol
             
-            # Determine token symbols for clarity
-            token0_symbol = self.metadata['token0'].symbol
-            token1_symbol = self.metadata['token1'].symbol
-            
-            # Convert to decimal amounts based on token decimals
-            token0_decimals = self.metadata['token0'].decimals
-            token1_decimals = self.metadata['token1'].decimals
-            
-            is_token0 = (asset == token0_symbol)
-            
-            logger.info(f"Computing slippage for {amount} {asset}, direction: {direction}")
-            logger.info(f"Current price: {current_market_price} {token0_symbol}/{token1_symbol}")
-            
-            if is_token0:
-                # Trading token0
-                if direction == 'buy':
-                    # Buying token0, selling token1
-                    # First, estimate how much token1 we need to swap for the desired token0
-                    # This is a rough estimate using the current price
-                    estimated_token1_amount = amount * current_market_price
-                    
-                    # Simulate the swap
-                    token0_out, token1_in, _ = self.liquidity_tracker.simulate_upward_swap(estimated_token1_amount)
-                    
-                    # Calculate effective price
-                    if token0_out > 0:
-                        effective_price = token1_in / token0_out
-                        slippage_bps = ((effective_price / current_market_price) - 1) * 10_000
-                        logger.info(f"Simulated buying {token0_out} {token0_symbol} for {token1_in} {token1_symbol}")
-                        logger.info(f"Effective price: {effective_price}, slippage: {slippage_bps} bps")
-                        return slippage_bps
-                else:
-                    # Selling token0, buying token1
-                    token1_out, token0_in, _ = self.liquidity_tracker.simulate_downward_swap(amount)
-                    
-                    if token1_out > 0:
-                        effective_price = token0_in / token1_out  # Inverse of what we want
-                        inverse_effective_price = 1 / effective_price if effective_price > 0 else 0
-                        slippage_bps = (1 - (inverse_effective_price / current_market_price)) * 10_000
-                        logger.info(f"Simulated selling {token0_in} {token0_symbol} for {token1_out} {token1_symbol}")
-                        logger.info(f"Effective price: {inverse_effective_price}, slippage: {slippage_bps} bps")
-                        return slippage_bps
+            if is_token0 and direction == 'sell':
+                # Selling token0 for token1 - simulate upward swap
+                simulation_direction = 'upward'
+                total_output, ending_tick = liquidity_tracker.simulate_swap(amount, direction=simulation_direction)
+                # Effective price = token1/token0
+                effective_price = total_output / amount if amount > 0 else 0
+                slippage_bps = ((market_price - effective_price) / market_price) * 10000
+            elif is_token0 and direction == 'buy':
+                # Buying token0 with token1 - simulate downward swap
+                simulation_direction = 'downward'
+                # Convert amount of token0 to equivalent token1 using market price
+                amount_token1 = amount * market_price
+                total_output, ending_tick = liquidity_tracker.simulate_swap(amount_token1, direction=simulation_direction)
+                # Effective price = token1/token0
+                effective_price = amount_token1 / total_output if total_output > 0 else 0
+                slippage_bps = ((effective_price - market_price) / market_price) * 10000
+            elif is_token1 and direction == 'sell':
+                # Selling token1 for token0 - simulate downward swap
+                simulation_direction = 'downward'
+                total_output, ending_tick = liquidity_tracker.simulate_swap(amount, direction=simulation_direction)
+                # Effective price = token0/token1 -> invert to get token1/token0
+                effective_price = amount / total_output if total_output > 0 else 0
+                slippage_bps = ((1/market_price - 1/effective_price) / (1/market_price)) * 10000
+            elif is_token1 and direction == 'buy':
+                # Buying token1 with token0 - simulate upward swap
+                simulation_direction = 'upward'
+                # Convert amount of token1 to equivalent token0 using market price
+                amount_token0 = amount / market_price
+                total_output, ending_tick = liquidity_tracker.simulate_swap(amount_token0, direction=simulation_direction)
+                # Effective price = token1/token0
+                effective_price = total_output / amount_token0 if amount_token0 > 0 else 0
+                slippage_bps = ((effective_price - market_price) / market_price) * 10000
             else:
-                # Trading token1
-                if direction == 'buy':
-                    # Buying token1, selling token0
-                    estimated_token0_amount = amount / current_market_price
-                    
-                    token1_out, token0_in, _ = self.liquidity_tracker.simulate_downward_swap(estimated_token0_amount)
-                    
-                    if token1_out > 0:
-                        effective_price = token0_in / token1_out
-                        inverse_effective_price = 1 / effective_price if effective_price > 0 else 0
-                        slippage_bps = (1 - (inverse_effective_price / current_market_price)) * 10_000
-                        logger.info(f"Simulated buying {token1_out} {token1_symbol} for {token0_in} {token0_symbol}")
-                        logger.info(f"Effective price: {inverse_effective_price}, slippage: {slippage_bps} bps")
-                        return slippage_bps
-                else:
-                    # Selling token1, buying token0
-                    token0_out, token1_in, _ = self.liquidity_tracker.simulate_upward_swap(amount)
-                    
-                    if token0_out > 0:
-                        effective_price = token1_in / token0_out
-                        slippage_bps = ((effective_price / current_market_price) - 1) * 10_000
-                        logger.info(f"Simulated selling {token1_in} {token1_symbol} for {token0_out} {token0_symbol}")
-                        logger.info(f"Effective price: {effective_price}, slippage: {slippage_bps} bps")
-                        return slippage_bps
+                logger.warning(f"Unknown asset or direction combination: {asset}, {direction}")
+                return await self._compute_simple_slippage_cost(asset, amount, direction)
             
-            # If we get here, something went wrong with the simulation
-            logger.error("Failed to compute slippage, falling back to simple estimate")
-            return await self._compute_simple_slippage_cost(asset, amount, direction)
+            logger.info(f"Slippage calculation results for {amount} {asset} ({direction}):")
+            logger.info(f"  Market price: {market_price:.6f}")
+            logger.info(f"  Effective price: {effective_price:.6f}")
+            logger.info(f"  Ending tick: {ending_tick}")
+            logger.info(f"  Slippage (bps): {slippage_bps:.2f}")
             
+            # Use absolute value to ensure slippage is always positive
+            return abs(slippage_bps)
+        
         except Exception as e:
-            logger.error(f"Error computing slippage: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
+            logger.error(f"Error in slippage calculation: {str(e)}")
+            logger.info("Falling back to simple slippage calculation")
             return await self._compute_simple_slippage_cost(asset, amount, direction)
+
+    def get_market_price(self, asset: str) -> float:
+        """
+        Placeholder method to get the current market price of the asset.
+        
+        Args:
+            asset: The asset for which to get the market price.
+            
+        Returns:
+            The current market price of the asset.
+        """
+        # Placeholder implementation, should be replaced with actual logic
+        return 1.0
     
     async def _compute_simple_slippage_cost(self, asset: str, amount: float, direction: str) -> float:
         """

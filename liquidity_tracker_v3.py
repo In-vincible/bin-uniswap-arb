@@ -192,6 +192,8 @@ class LiquidityTracker:
             # Update range totals
             self.range_totals[key] = self.range_totals.get(key, 0) + liquidity
             
+            logger.debug(f"Initialized position: ({tick_lower}, {tick_upper}) with liquidity {liquidity} for owner {owner[:8]}...")
+        
         logger.info(f"Initialized {len(self.positions)} unique position ranges")
         logger.info(f"Total unique owner-range combinations: {sum(len(owners) for owners in self.positions.values())}")
 
@@ -288,8 +290,9 @@ class LiquidityTracker:
         for (tick_lower, tick_upper), total_liquidity in self.range_totals.items():
             if tick_lower <= self.current_tick <= tick_upper:
                 active_liquidity += total_liquidity
+                logger.debug(f"Active position: ({tick_lower}, {tick_upper}) with liquidity {total_liquidity}")
         
-        logger.info(f"Active liquidity at tick {self.current_tick}: {active_liquidity}")
+        logger.info(f"Total active liquidity at tick {self.current_tick}: {active_liquidity}")
         return active_liquidity
     
     def get_position_liquidity(self, tick_lower: int, tick_upper: int, owner: Optional[str] = None) -> int:
@@ -316,204 +319,74 @@ class LiquidityTracker:
             # Return total liquidity for this range
             return self.range_totals[key]
     
-    def simulate_upward_swap(self, token1_amount: float, max_ticks: int = 1000) -> Tuple[float, float, int]:
+    def simulate_swap(self, amount_in_token0: float, direction: str = 'upward') -> Tuple[float, int]:
         """
-        Simulate an upward swap (selling token1 to buy token0) across multiple ticks.
-        
-        This simulates price movement upwards (increasing), crossing tick boundaries as needed
-        until the entire token1_amount is consumed or max_ticks is reached.
+        Simulate a swap across multiple ticks using a tick-by-tick approach.
         
         Args:
-            token1_amount: Amount of token1 to sell
-            max_ticks: Maximum number of ticks to search (to prevent infinite loops)
+            amount_in_token0: Amount of token0 to swap (in token0 units)
+            direction: 'upward' for selling token1 to buy token0, 'downward' for the opposite
             
         Returns:
-            Tuple of (token0_out, token1_in, ending_tick) where:
-            - token0_out: Amount of token0 received
-            - token1_in: Actual amount of token1 consumed (may be less than token1_amount if liquidity is exhausted)
+            Tuple of (total_dy_out, ending_tick) where:
+            - total_dy_out: Total amount of token1 received (in token1 units)
             - ending_tick: The final tick after the swap
         """
-        if self.current_tick is None:
-            logger.warning("Current tick is not set; cannot simulate swap.")
-            return 0.0, 0.0, 0
-            
-        # Sort all positions by tick boundaries to simulate crossing ticks
-        tick_boundaries = set()
-        for (tick_lower, tick_upper) in self.positions.keys():
-            tick_boundaries.add(tick_lower)
-            tick_boundaries.add(tick_upper)
-        
-        # Convert to sorted list to find next boundaries
-        tick_boundaries = sorted(list(tick_boundaries))
-        
-        # Initialize variables
-        token0_out = 0.0  # Amount of token0 received
-        token1_in = 0.0   # Amount of token1 consumed
-        current_tick = self.current_tick
-        token1_remaining = token1_amount
-        ticks_checked = 0
-        
-        while token1_remaining > 0 and ticks_checked < max_ticks:
-            # Find the next tick boundary above current_tick
-            next_tick = None
-            for tick in tick_boundaries:
-                if tick > current_tick:
-                    next_tick = tick
-                    break
-            
-            if next_tick is None:
-                # No more tick boundaries, use all remaining liquidity
-                logger.warning(f"No more tick boundaries above {current_tick}, terminating simulation")
-                break
-                
-            # Get active liquidity in the current range (current_tick to next_tick)
-            active_liquidity = 0
-            for (tick_lower, tick_upper), total_liquidity in self.range_totals.items():
-                if tick_lower <= current_tick < tick_upper:
-                    active_liquidity += total_liquidity
-            
-            if active_liquidity <= 0:
-                # No liquidity in this range, move to next tick
-                current_tick = next_tick
-                continue
-                
-            # Calculate how much token1 can be swapped in this range
-            # This is a simplified approximation - in a real implementation
-            # we would need to use the actual Uniswap math formulas
-            # L * (sqrt(p_upper) - sqrt(p_current)) for token1 input
-            # where p = price = 1.0001^tick
-            
-            # Calculate current and next sqrt prices (this is a very simplified model)
-            current_sqrt_price = 1.0001 ** (current_tick / 2)
-            next_sqrt_price = 1.0001 ** (next_tick / 2)
-            
-            # Calculate maximum token1 input for this range
-            max_token1_in_range = active_liquidity * (next_sqrt_price - current_sqrt_price)
-            
-            if token1_remaining <= max_token1_in_range:
-                # We can complete the swap within this range
-                fraction = token1_remaining / max_token1_in_range
-                token0_out_range = active_liquidity * (1/current_sqrt_price - 1/next_sqrt_price) * fraction
-                
-                token0_out += token0_out_range
-                token1_in += token1_remaining
-                
-                # Calculate ending tick based on fraction of range used
-                ending_tick = current_tick + int((next_tick - current_tick) * fraction)
-                return token0_out, token1_in, ending_tick
+        if self.current_tick is None or self.current_sqrtPriceX96 is None:
+            logger.warning("Current tick or sqrtPriceX96 is not set; cannot simulate swap.")
+            return 0.0, 0
+
+        amount_remaining = amount_in_token0
+        sqrtP = self.current_sqrtPriceX96
+        L = self.get_active_liquidity()
+        tick = self.current_tick
+        total_dy_out = 0.0
+
+        while amount_remaining > 0:
+            sqrtP_next = self.sqrt_price_at_next_tick(tick + 1)
+            dx_max = L * (1/sqrtP - 1/sqrtP_next)
+
+            if amount_remaining < dx_max:
+                sqrtP_new = 1 / (1/sqrtP - amount_remaining / L)
+                dy = L * (sqrtP_new - sqrtP)
+                sqrtP = sqrtP_new
+                amount_remaining = 0
             else:
-                # We consume all liquidity in this range and need to move to the next
-                token0_out_range = active_liquidity * (1/current_sqrt_price - 1/next_sqrt_price)
-                
-                token0_out += token0_out_range
-                token1_in += max_token1_in_range
-                token1_remaining -= max_token1_in_range
-                
-                # Move to the next tick
-                current_tick = next_tick
-                ticks_checked += 1
-        
-        logger.warning(f"Simulation reached {ticks_checked} ticks, token1 remaining: {token1_remaining}")
-        return token0_out, token1_in, current_tick
-    
-    def simulate_downward_swap(self, token0_amount: float, max_ticks: int = 1000) -> Tuple[float, float, int]:
+                dy = L * (sqrtP_next - sqrtP)
+                amount_remaining -= dx_max
+                sqrtP = sqrtP_next
+                tick += 1
+                L += self.tick_liquidity_delta(tick)
+
+            total_dy_out += dy
+
+        logger.info(f"Completed swap: total_dy_out={total_dy_out}, ending_tick={tick}")
+        return total_dy_out, tick
+
+    def sqrt_price_at_next_tick(self, tick: int) -> float:
         """
-        Simulate a downward swap (selling token0 to buy token1) across multiple ticks.
-        
-        This simulates price movement downwards (decreasing), crossing tick boundaries as needed
-        until the entire token0_amount is consumed or max_ticks is reached.
+        Calculate the sqrt price at the next tick.
         
         Args:
-            token0_amount: Amount of token0 to sell
-            max_ticks: Maximum number of ticks to search (to prevent infinite loops)
+            tick: The tick for which to calculate the sqrt price
             
         Returns:
-            Tuple of (token1_out, token0_in, ending_tick) where:
-            - token1_out: Amount of token1 received
-            - token0_in: Actual amount of token0 consumed (may be less than token0_amount if liquidity is exhausted)
-            - ending_tick: The final tick after the swap
+            The sqrt price at the given tick
         """
-        if self.current_tick is None:
-            logger.warning("Current tick is not set; cannot simulate swap.")
-            return 0.0, 0.0, 0
-            
-        # Sort all positions by tick boundaries to simulate crossing ticks
-        tick_boundaries = set()
-        for (tick_lower, tick_upper) in self.positions.keys():
-            tick_boundaries.add(tick_lower)
-            tick_boundaries.add(tick_upper)
+        return 1.0001 ** (tick / 2)
+
+    def tick_liquidity_delta(self, tick: int) -> float:
+        """
+        Calculate the change in liquidity at a given tick.
         
-        # Convert to sorted list to find next boundaries
-        tick_boundaries = sorted(list(tick_boundaries), reverse=True)  # Descending for downward swaps
-        
-        # Initialize variables
-        token1_out = 0.0  # Amount of token1 received
-        token0_in = 0.0   # Amount of token0 consumed
-        current_tick = self.current_tick
-        token0_remaining = token0_amount
-        ticks_checked = 0
-        
-        while token0_remaining > 0 and ticks_checked < max_ticks:
-            # Find the next tick boundary below current_tick
-            next_tick = None
-            for tick in tick_boundaries:
-                if tick < current_tick:
-                    next_tick = tick
-                    break
+        Args:
+            tick: The tick for which to calculate the liquidity change
             
-            if next_tick is None:
-                # No more tick boundaries, use all remaining liquidity
-                logger.warning(f"No more tick boundaries below {current_tick}, terminating simulation")
-                break
-                
-            # Get active liquidity in the current range (next_tick to current_tick)
-            active_liquidity = 0
-            for (tick_lower, tick_upper), total_liquidity in self.range_totals.items():
-                if tick_lower <= current_tick and tick_lower > next_tick:
-                    active_liquidity += total_liquidity
-            
-            if active_liquidity <= 0:
-                # No liquidity in this range, move to next tick
-                current_tick = next_tick
-                continue
-                
-            # Calculate how much token0 can be swapped in this range
-            # This is a simplified approximation - in a real implementation
-            # we would need to use the actual Uniswap math formulas
-            # L * (sqrt(p_current) - sqrt(p_lower)) for token0 input
-            
-            # Calculate current and next sqrt prices (simplified model)
-            current_sqrt_price = 1.0001 ** (current_tick / 2)
-            next_sqrt_price = 1.0001 ** (next_tick / 2)
-            
-            # Calculate maximum token0 input for this range
-            max_token0_in_range = active_liquidity * (current_sqrt_price - next_sqrt_price)
-            
-            if token0_remaining <= max_token0_in_range:
-                # We can complete the swap within this range
-                fraction = token0_remaining / max_token0_in_range
-                token1_out_range = active_liquidity * (next_sqrt_price - current_sqrt_price) * fraction
-                
-                token1_out += token1_out_range
-                token0_in += token0_remaining
-                
-                # Calculate ending tick based on fraction of range used
-                ending_tick = current_tick - int((current_tick - next_tick) * fraction)
-                return token1_out, token0_in, ending_tick
-            else:
-                # We consume all liquidity in this range and need to move to the next
-                token1_out_range = active_liquidity * (next_sqrt_price - current_sqrt_price)
-                
-                token1_out += token1_out_range
-                token0_in += max_token0_in_range
-                token0_remaining -= max_token0_in_range
-                
-                # Move to the next tick
-                current_tick = next_tick
-                ticks_checked += 1
-        
-        logger.warning(f"Simulation reached {ticks_checked} ticks, token0 remaining: {token0_remaining}")
-        return token1_out, token0_in, current_tick
+        Returns:
+            The change in liquidity at the given tick
+        """
+        # Placeholder implementation, should be replaced with actual logic
+        return 0.0
     
     def calculate_effective_price(self, token0_amount: float, token1_amount: float) -> Tuple[float, float]:
         """
@@ -557,6 +430,39 @@ class LiquidityTracker:
         if self._subgraph:
             await self._subgraph.close()
             logger.info("Closed subgraph connection")
+
+    def get_liquidity_by_tick(self, tick: int) -> int:
+        """
+        Get the total liquidity for a specific tick.
+        
+        Args:
+            tick: The tick for which to get the total liquidity.
+            
+        Returns:
+            Total liquidity at the specified tick.
+        """
+        total_liquidity = 0
+        for (tick_lower, tick_upper), liquidity in self.range_totals.items():
+            if tick_lower <= tick <= tick_upper:
+                total_liquidity += liquidity
+        return total_liquidity
+
+    def get_liquidity_by_tick_range(self, tick_lower: int, tick_upper: int) -> int:
+        """
+        Get the total liquidity for a specific tick range.
+        
+        Args:
+            tick_lower: The lower bound of the tick range.
+            tick_upper: The upper bound of the tick range.
+            
+        Returns:
+            Total liquidity within the specified tick range.
+        """
+        total_liquidity = 0
+        for (range_lower, range_upper), liquidity in self.range_totals.items():
+            if range_lower <= tick_upper and range_upper >= tick_lower:
+                total_liquidity += liquidity
+        return total_liquidity
 
 
 # Example usage
