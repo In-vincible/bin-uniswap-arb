@@ -1,4 +1,4 @@
-# Arbitrage Trading Bot
+# Binance-uniswap ARB bot
 
 ## Basic Philosophy
 
